@@ -1,0 +1,35 @@
+[model]
+package = "opencall.models.conformer"
+
+[labels]
+labels = [ "N", "A", "C", "G", "T",]
+
+[input]
+features = 1
+
+[qscore]
+bias = 0.0
+scale = 1.0
+
+[encoder]
+stride = 5
+winlen = 19
+scale = 5.0
+features = 512
+activation = "swish"
+blank_score = 2.0
+num_layers = 12
+num_heads = 8
+enc_dim = 512
+conv_kernel_size = 15
+feed_forward_expansion_factor = 4
+conv_expansion_factor = 2
+half_step_residual = true
+
+[global_norm]
+state_len = 5
+
+[basecaller]
+batchsize = 64
+chunksize = 5000
+overlap = 500
