@@ -95,9 +95,15 @@ def model_eval(dataloader, model_dir, weight_path, is_half, device):
             total_samples += data.shape[0] * data.shape[2]
             log_probs = model(data)
             if hasattr(model, "decode_batch"):
+                start_time = time.perf_counter()
                 seqs.extend(model.decode_batch(log_probs))
+                end_time = time.perf_counter()
+                print(f"Decode batch time: {end_time - start_time} seconds for {len(seqs)} sequences")
             else:
+                start_time = time.perf_counter()
                 seqs.extend([model.decode(p) for p in permute(log_probs, "TNC", "NTC")])
+                end_time = time.perf_counter()
+                print(f"Decode time: {end_time - start_time} seconds for {len(seqs)} sequences")
     duration = time.perf_counter() - t0
 
     refs = [decode_ref(target, model.alphabet, encoder_only=True) for target in targets]
@@ -152,6 +158,8 @@ def loading_hd5_in_one_dir(args, data_dir, batch_size, gen_dataloader=True, enco
                 train_dataset_orig, [args.limit_train_size, len(train_dataset_orig)-args.limit_train_size])
         else:
             train_dataset = train_dataset_orig
+    else:
+        train_dataset = train_dataset_orig
     return train_dataset, test_dataset
 
 

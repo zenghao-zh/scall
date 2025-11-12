@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Script to read and display information from a single HDF5 file
+Script to read and display information from HDF5 files in a directory
 """
 import sys
 import h5py
 import numpy as np
+import os
+from pathlib import Path
 
 
 def print_attrs(name, obj):
@@ -57,62 +59,175 @@ def print_dataset_info(name, obj):
                 print(f"    (Could not read sample data: {e})")
 
 
-def read_hdf5_file(filepath):
+def read_hdf5_file(filepath, verbose=True):
     """Read and display information about an HDF5 file"""
-    print(f"Reading HDF5 file: {filepath}")
-    print("=" * 80)
+    if verbose:
+        print(f"Reading HDF5 file: {filepath}")
+        print("=" * 80)
     
     try:
         with h5py.File(filepath, 'r') as f:
-            # Print file-level attributes
-            print("\nFile-level attributes:")
+            # Always read file-level attributes (to check accessibility)
+            if verbose:
+                print("\nFile-level attributes:")
             if f.attrs:
                 for key, val in f.attrs.items():
-                    print(f"  {key}: {val}")
+                    if verbose:
+                        print(f"  {key}: {val}")
             else:
-                print("  (No file-level attributes)")
+                if verbose:
+                    print("  (No file-level attributes)")
             
-            # Print top-level keys
-            print(f"\nTop-level keys: {list(f.keys())}")
+            # Always get top-level keys (to check structure)
+            keys = list(f.keys())
+            if verbose:
+                print(f"\nTop-level keys: {keys}")
+                print("\nDataset/Group details:")
+                print("-" * 80)
             
-            # Print information about each dataset/group
-            print("\nDataset/Group details:")
-            print("-" * 80)
-            
+            # Always visit all items to check data integrity
             def visit_func(name, obj):
                 if isinstance(obj, h5py.Group):
-                    print(f"\n  Group: {name}/")
-                    print_attrs(name, obj)
+                    # Check group attributes
+                    _ = dict(obj.attrs.items())
+                    if verbose:
+                        print(f"\n  Group: {name}/")
+                        print_attrs(name, obj)
                 elif isinstance(obj, h5py.Dataset):
-                    print_dataset_info(name, obj)
+                    # Check dataset properties and try to read a sample
+                    _ = obj.shape
+                    _ = obj.dtype
+                    _ = obj.size
+                    
+                    # Try to read a small sample to verify data accessibility
+                    if obj.size > 0:
+                        try:
+                            if len(obj.shape) == 1:
+                                _ = obj[:min(5, obj.shape[0])]
+                            elif len(obj.shape) == 2:
+                                _ = obj[:min(3, obj.shape[0]), :min(5, obj.shape[1])]
+                            else:
+                                _ = obj[0]
+                        except Exception as e:
+                            raise Exception(f"Error reading dataset '{name}': {e}")
+                    
+                    if verbose:
+                        print_dataset_info(name, obj)
             
             # Visit all items in the file
             f.visititems(visit_func)
             
             # If there are datasets at root level
-            for key in f.keys():
+            for key in keys:
                 if isinstance(f[key], h5py.Dataset):
-                    print_dataset_info(key, f[key])
+                    obj = f[key]
+                    # Check dataset
+                    _ = obj.shape
+                    _ = obj.dtype
+                    _ = obj.size
+                    
+                    # Try to read a small sample
+                    if obj.size > 0:
+                        try:
+                            if len(obj.shape) == 1:
+                                _ = obj[:min(5, obj.shape[0])]
+                            elif len(obj.shape) == 2:
+                                _ = obj[:min(3, obj.shape[0]), :min(5, obj.shape[1])]
+                            else:
+                                _ = obj[0]
+                        except Exception as e:
+                            raise Exception(f"Error reading root dataset '{key}': {e}")
+                    
+                    if verbose:
+                        print_dataset_info(key, f[key])
             
-            print("\n" + "=" * 80)
-            print("Successfully read the HDF5 file!")
+            if verbose:
+                print("\n" + "=" * 80)
+                print("Successfully read the HDF5 file!")
             
     except Exception as e:
-        print(f"\nError reading file: {e}")
-        import traceback
-        traceback.print_exc()
+        if verbose:
+            print(f"\nError reading file: {e}")
+            import traceback
+            traceback.print_exc()
+        return False, str(e)
+    
+    return True, None
+
+
+def process_directory(directory_path):
+    """Process all HDF5 files in a directory"""
+    directory = Path(directory_path)
+    
+    if not directory.exists():
+        print(f"Error: Directory does not exist: {directory_path}")
         return 1
+    
+    if not directory.is_dir():
+        print(f"Error: Path is not a directory: {directory_path}")
+        return 1
+    
+    # Find all .hd5 files
+    hd5_files = list(directory.glob("*.hd5"))
+    
+    if not hd5_files:
+        print(f"No .hd5 files found in {directory_path}")
+        return 1
+    
+    print(f"Found {len(hd5_files)} HDF5 files in {directory_path}")
+    print("=" * 80)
+    
+    failed_files = []
+    success_count = 0
+    
+    for i, filepath in enumerate(hd5_files, 1):
+        print(f"\n[{i}/{len(hd5_files)}] Processing: {filepath.name}")
+        success, error_msg = read_hdf5_file(filepath, verbose=False)
+        
+        if success:
+            print(f"  ✓ Success")
+            success_count += 1
+        else:
+            print(f"  ✗ Failed: {error_msg}")
+            failed_files.append((filepath.name, error_msg))
+    
+    # Summary
+    print("\n" + "=" * 80)
+    print("SUMMARY")
+    print("=" * 80)
+    print(f"Total files processed: {len(hd5_files)}")
+    print(f"Successful: {success_count}")
+    print(f"Failed: {len(failed_files)}")
+    
+    if failed_files:
+        print("\n" + "=" * 80)
+        print("FAILED FILES:")
+        print("=" * 80)
+        for filename, error_msg in failed_files:
+            print(f"\n  File: {filename}")
+            print(f"  Error: {error_msg}")
+    else:
+        print("\nAll files processed successfully! ✓")
     
     return 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python read_hdf5_file.py <hdf5_file_path>")
-        print("Example: python read_hdf5_file.py /workspace/huada/all_refs_label_for_ctc/train_data/250F600274011_first_hour1_1_44.hd5")
+    # Default directory to process
+    default_dir = "/workspace/huada/all_refs_label_for_ctc/train_data/train"
+    
+    if len(sys.argv) == 1:
+        # No arguments provided, use default directory
+        directory_path = default_dir
+        print(f"No directory specified, using default: {directory_path}\n")
+    elif len(sys.argv) == 2:
+        directory_path = sys.argv[1]
+    else:
+        print("Usage: python read_hdf5_file.py [directory_path]")
+        print(f"Default: python read_hdf5_file.py {default_dir}")
+        print("Example: python read_hdf5_file.py /path/to/hdf5/files")
         sys.exit(1)
     
-    filepath = sys.argv[1]
-    exit_code = read_hdf5_file(filepath)
+    exit_code = process_directory(directory_path)
     sys.exit(exit_code)
 

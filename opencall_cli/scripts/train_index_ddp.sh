@@ -15,7 +15,7 @@ WARMUP_STEPS=${10}
 OUTPUT_NAME=${11}
 
 
-CUDA_VISIBLE_DEVICES="2,3,6,7" python -m torch.distributed.launch --nproc_per_node $GPU_NUMS train_index_ddp.py  \
+CUDA_VISIBLE_DEVICES="4,5,6,7" python -m torch.distributed.launch --nproc_per_node $GPU_NUMS train_index_ddp.py  \
 	--data_dir $DATA_DIR \
 	--pre_trained_params_file      $PARAMS_FILE \
 	--batch_size         $BATCH_SIZE \

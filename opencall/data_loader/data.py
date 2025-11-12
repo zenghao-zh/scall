@@ -408,8 +408,13 @@ class TrainingDataSet3(Dataset):
         try:
             cur, refs = self._load_hd5(read_index, cur_start, cur_end, ref_start, ref_end, hd5_index)
         except Exception as e:
+            hd5_file = self.hd5_list[hd5_index]
+            per_num = hd5_file.attrs['batch_size']
+            batch_num = int(read_index // per_num)
+            read = hd5_file['batch_{}'.format(batch_num)]
             print(f"Error loading HD5 file: {e}")
-            return None, None
+            print(f"Read index: {read_index}, HD5 file: {hd5_file.filename}")
+            return None, None, None
 
 
         if self.tokenization == "flipflop":

@@ -22,7 +22,7 @@ import random
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3, 4, 5, 6, 7'
 os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '23324'
+os.environ['MASTER_PORT'] = '23333'
 
 def get_final_params_file_path(res_dir):
     weight_files = glob.glob(os.path.join(res_dir, "weights_*.tar"))
@@ -145,9 +145,10 @@ def main():
             # train one epoch
             #######################
             model.train()
+            step = 0
             for num, batch in enumerate(train_loader):
                 t0 = time.time()
-                step = 0
+                
                 smoothed_loss = None
     
                 #######################

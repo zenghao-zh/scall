@@ -13,12 +13,18 @@ from opencall.models.common.nn import (
     layers,
     from_dict,
 )
-import sys
+# import sys
 # sys.path.append('/store/zjj/coding/tmp/opencall/opencall/libs')
 
 from seqdist import sparse
 from seqdist.ctc_simple import logZ_cupy, viterbi_alignments
 from seqdist.core import SequenceDist, Max, Log, semiring
+
+try:
+    from koi.decode import beam_search as koi_beam_search, to_str
+    KOI_AVAILABLE = True
+except ImportError:
+    KOI_AVAILABLE = False
 
 
 def get_stride(m):
@@ -244,18 +250,181 @@ class seqdistModel(Module):
     def forward(self, x):
         return self.encoder(x)
 
-    def decode_batch(self, x):
-        scores = self.seqdist.posteriors(x.to(torch.float32)) + 1e-8
-        tracebacks = self.seqdist.viterbi(scores.log()).to(torch.int16).T
-        return [self.seqdist.path_to_str(x) for x in tracebacks.cpu().numpy()]
+    def decode_batch(self, x, beam_width=1, beam_cut=100, scale=1.0, offset=0.0, blank_score=2.0, use_koi=True):
+        """
+        Decode a batch of scores using either koi beam_search or viterbi decoding.
+        
+        Args:
+            x: scores tensor of shape (T, N, C)
+            beam_width: beam width for beam search
+            beam_cut: beam cut threshold for beam search
+            scale: scale factor for beam search
+            offset: offset for beam search
+            blank_score: blank score for beam search
+            use_koi: whether to use koi beam_search (if available)
+            
+        Returns:
+            list of decoded sequences
+        """
+        if use_koi and KOI_AVAILABLE:
+            # Use koi beam_search
+            # Permute from (T, N, C) to (N, T, C)
+            T, N, C = x.shape
+            scores = x.permute(1, 0, 2).contiguous()
+            
+            # Reshape to remove blank: (N, T, n_states, n_alphabet) -> (N, T, n_states, n_bases)
+            # C = n_states * n_alphabet, where n_alphabet = n_base + 1 (including blank)
+            n_states = self.seqdist.n_base ** self.seqdist.state_len
+            n_alphabet = len(self.seqdist.alphabet)  # n_base + 1 (including blank)
+            
+            # Reshape: (N, T, C) -> (N, T, n_states, n_alphabet)
+            scores = scores.reshape(N, T, n_states, n_alphabet)
+            # Remove blank (first element): keep [:, :, :, 1:]
+            scores = scores[:, :, :, 1:]
+            # Reshape back: (N, T, n_states, n_base) -> (N, T, n_states * n_base)
+            scores = scores.reshape(N, T, -1).contiguous()
+            
+            # Convert to fp16 (required by koi)
+            if scores.dtype != torch.float16:
+                scores = scores.to(torch.float16)
+            
+            # Call koi beam_search
+            sequence, qstring, moves = koi_beam_search(
+                scores,
+                beam_width=beam_width,
+                beam_cut=beam_cut,
+                scale=scale,
+                offset=offset,
+                blank_score=blank_score,
+            )
+            
+            # Convert each sequence to string using to_str
+            results = []
+            for i in range(N):
+                seq_str = to_str(sequence[i])
+                results.append(seq_str)
+            
+            return results
+        else:
+            # Fallback to viterbi decoding
+            scores = self.seqdist.posteriors(x.to(torch.float32)) + 1e-8
+            tracebacks = self.seqdist.viterbi(scores.log()).to(torch.int16).T
+            return [self.seqdist.path_to_str(path) for path in tracebacks.cpu().numpy()]
 
     def get_path(self, x):
         scores = self.seqdist.posteriors(x.to(torch.float32)) + 1e-8
         tracebacks = self.seqdist.viterbi(scores.log()).to(torch.int16).T
         return tracebacks.cpu().numpy()[0]
 
-    def decode(self, x):
-        return self.decode_batch(x.unsqueeze(1))[0]
+    def decode(self, x, beam_width=5, beam_cut=1e-3, scale=1.0, offset=0.0, blank_score=2.0, use_koi=True):
+        """
+        Decode a single sample.
+        
+        Args:
+            x: scores tensor of shape (T, C) or (T, 1, C)
+            beam_width: beam width for beam search
+            beam_cut: beam cut threshold for beam search
+            scale: scale factor for beam search
+            offset: offset for beam search
+            blank_score: blank score for beam search
+            use_koi: whether to use koi beam_search (if available)
+            
+        Returns:
+            decoded sequence string
+        """
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # (T, C) -> (T, 1, C)
+        return self.decode_batch(
+            x, 
+            beam_width=beam_width, 
+            beam_cut=beam_cut, 
+            scale=scale,
+            offset=offset,
+            blank_score=blank_score,
+            use_koi=use_koi
+        )[0]
+
+    def greedy_decode(self, x):
+        """
+        Greedy decoding guided by backward scores (equivalent to beam_search with k=1).
+        
+        This uses forward-backward algorithm:
+        1. Compute backward scores for guidance
+        2. At each time step, select transition with highest (edge_score + backward_score)
+        3. Follow the greedy path through the lattice
+        
+        Args:
+            x: scores tensor of shape (T, C) or (T, N, C)
+            
+        Returns:
+            decoded sequence string (if T, C) or list of strings (if T, N, C)
+        """
+        # Handle single sample or batch
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # (T, C) -> (T, 1, C)
+            single_sample = True
+        else:
+            single_sample = False
+        
+        T, N, C = x.shape
+        x = x.to(torch.float32)
+        
+        # Get model parameters
+        n_states = self.seqdist.n_base ** self.seqdist.state_len
+        n_alphabet = len(self.seqdist.alphabet)  # n_base + 1 (including blank)
+        
+        # Reshape scores: (T, N, C) -> (T, N, n_states, n_alphabet)
+        scores = x.reshape(T, N, n_states, n_alphabet)
+        
+        # Compute backward scores for guidance: (T+1, N, n_states)
+        betas = self.seqdist.backward_scores(x)
+        
+        # Add backward scores to edge scores
+        # For transition (old_state, action) -> new_state at time t:
+        # guided_score = edge_score[t, old_state, action] + beta[t+1, new_state]
+        idx_long = self.seqdist.idx.long().to(betas.device)  # (n_states, n_alphabet)
+        betas_for_transitions = torch.gather(
+            betas[1:].unsqueeze(2).expand(T, N, n_states, n_states),  # (T, N, n_states, n_states)
+            dim=3,
+            index=idx_long.unsqueeze(0).unsqueeze(0).expand(T, N, -1, -1)  # (T, N, n_states, n_alphabet)
+        )  # Result: (T, N, n_states, n_alphabet)
+        guided_scores = scores + betas_for_transitions
+        
+        # Initialize: all samples start from state 0 (e.g., "AAAAA" for 5-mer)
+        current_states = torch.zeros(N, dtype=torch.long, device=x.device)
+        paths = []
+        
+        # Greedy forward pass using guided scores
+        for t in range(T):
+            batch_idx = torch.arange(N, device=x.device, dtype=torch.long)
+            state_scores = guided_scores[t, batch_idx, current_states, :]  # (N, n_alphabet)
+            
+            # Greedy: select action with highest guided score
+            best_actions = state_scores.argmax(dim=1)  # (N,)
+            
+            # Transition to next states
+            next_states = self.seqdist.idx[current_states, best_actions].long()  # (N,)
+            
+            paths.append(best_actions.cpu())
+            current_states = next_states
+        
+        # Convert to sequences
+        paths = torch.stack(paths, dim=0).T.numpy()  # (N, T)
+        results = [self.seqdist.path_to_str(paths[n]) for n in range(N)]
+        
+        return results[0] if single_sample else results
+    
+    def greedy_decode_batch(self, x):
+        """
+        Batch version of greedy decode.
+        
+        Args:
+            x: scores tensor of shape (T, N, C)
+            
+        Returns:
+            list of decoded sequences
+        """
+        return self.greedy_decode(x)
 
     def loss(self, scores, targets, target_lengths, **kwargs):
         return self.seqdist.ctc_loss(
