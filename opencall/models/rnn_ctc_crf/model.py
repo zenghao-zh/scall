@@ -135,6 +135,53 @@ class CTC_CRF(SequenceDist):
         paths = traceback.argmax(2) % len(self.alphabet)
         return paths
 
+    def viterbi_fused(self, scores):
+        """
+        融合的 Viterbi 解码：一次 forward 遍历 + traceback
+        Args:
+            scores: (T, N, C) 原始分数张量
+        Returns:
+            paths: (N, T) 解码路径，值为 0=blank, 1-4=ACGT
+        """
+        T, N, _ = scores.shape
+        n_states = self.n_base ** self.state_len
+        n_alphabet = len(self.alphabet)  # NZ = n_base + 1
+        
+        # Ms[t, n, c, z] = 在时间 t，从状态 idx[c,z] 转移到状态 c 的分数
+        Ms = scores.reshape(T, N, n_states, n_alphabet)
+        device = scores.device
+        idx = self.idx.to(device=device, dtype=torch.long)  # (C, NZ)
+        
+        # ========== Forward Pass ==========
+        # alpha[n, c] = 到达状态 c 的最优路径分数
+        alpha = torch.zeros(N, n_states, device=device, dtype=scores.dtype)
+        # traceback[t, n, c] = 在时间 t 到达状态 c 的最优边索引 z
+        traceback = torch.zeros(T, N, n_states, dtype=torch.long, device=device)
+        
+        for t in range(T):
+            # 获取所有入边的来源状态分数
+            # alpha[:, idx] 形状: (N, C, NZ)
+            prev_scores = alpha[:, idx]  # (N, C, NZ)
+            # 加上边分数: candidates[n, c, z] = alpha[n, idx[c,z]] + Ms[t, n, c, z]
+            candidates = prev_scores + Ms[t]  # (N, C, NZ)
+            # 对每个目标状态，选择最优的入边
+            alpha, traceback[t] = candidates.max(dim=-1)  # 都是 (N, C)
+        # ========== Backward Traceback ==========
+        # 找到终止时刻的最优状态
+        current_states = alpha.argmax(dim=-1)  # (N,)
+        # 回溯路径
+        paths = torch.zeros(T, N, dtype=torch.long, device=device)
+        batch_idx = torch.arange(N, device=device)
+        for t in range(T - 1, -1, -1):
+            # 获取到达 current_states 的最优边
+            best_edges = traceback[t, batch_idx, current_states]  # (N,)
+            # 边索引就是 action: 0=blank, 1=A, 2=C, 3=G, 4=T
+            paths[t] = best_edges
+            # 更新 current_states 为来源状态
+            current_states = idx[current_states, best_edges]
+        
+        return paths.T  # (N, T)
+
     def path_to_str(self, path):
         alphabet = np.frombuffer("".join(self.alphabet).encode(), dtype="u1")
         seq = alphabet[path[path != 0]]
@@ -250,7 +297,7 @@ class seqdistModel(Module):
     def forward(self, x):
         return self.encoder(x)
 
-    def decode_batch(self, x, beam_width=1, beam_cut=100, scale=1.0, offset=0.0, blank_score=2.0, use_koi=True):
+    def decode_batch(self, x, beam_width=1, beam_cut=100, scale=1.0, offset=0.0, blank_score=2.0, use_koi=False):
         """
         Decode a batch of scores using either koi beam_search or viterbi decoding.
         
@@ -305,16 +352,20 @@ class seqdistModel(Module):
                 results.append(seq_str)
             
             return results
-        else:
-            # Fallback to viterbi decoding
-            scores = self.seqdist.posteriors(x.to(torch.float32)) + 1e-8
-            tracebacks = self.seqdist.viterbi(scores.log()).to(torch.int16).T
-            return [self.seqdist.path_to_str(path) for path in tracebacks.cpu().numpy()]
+        else:           # Fallback to viterbi decoding
+            # scores = self.seqdist.posteriors(x.to(torch.float32)) + 1e-8
+            # tracebacks = self.seqdist.viterbi(scores.log()).to(torch.int16).T
+            # return [self.seqdist.path_to_str(path) for path in tracebacks.cpu().numpy()]
+
+            # Fallback to viterbi_fused (much faster than posteriors×2)
+            with torch.no_grad():
+                paths = self.seqdist.viterbi_fused(x.to(torch.float32))
+            return [self.seqdist.path_to_str(path) for path in paths.cpu().numpy()]
 
     def get_path(self, x):
-        scores = self.seqdist.posteriors(x.to(torch.float32)) + 1e-8
-        tracebacks = self.seqdist.viterbi(scores.log()).to(torch.int16).T
-        return tracebacks.cpu().numpy()[0]
+        with torch.no_grad():
+            paths = self.seqdist.viterbi_fused(x.to(torch.float32))
+        return paths.cpu().numpy()[0]
 
     def decode(self, x, beam_width=5, beam_cut=1e-3, scale=1.0, offset=0.0, blank_score=2.0, use_koi=True):
         """
