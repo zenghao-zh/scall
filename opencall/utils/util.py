@@ -98,7 +98,7 @@ def model_eval(dataloader, model_dir, weight_path, is_half, device):
                 start_time = time.perf_counter()
                 seqs.extend(model.decode_batch(log_probs))
                 end_time = time.perf_counter()
-                print(f"Decode batch time: {end_time - start_time} seconds for {len(seqs)} sequences")
+                # print(f"Decode batch time: {end_time - start_time} seconds for {len(seqs)} sequences")
             else:
                 start_time = time.perf_counter()
                 seqs.extend([model.decode(p) for p in permute(log_probs, "TNC", "NTC")])

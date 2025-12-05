@@ -77,7 +77,7 @@ class CTC_CRF(SequenceDist):
         T, N, _ = scores.shape
         Ms = scores.reshape(T, N, -1, self.n_base + 1)
         beta_T = Ms.new_full((N, self.n_base ** (self.state_len)), S.one)
-        return sparse.bwd_scores_cupy(Ms, self.idx, beta_T, S, K=1)
+        return sparse.bwd_scores_cupy_python(Ms, self.idx, beta_T, S, K=1)
 
     def compute_transition_probs(self, scores, betas):
         T, N, C = scores.shape
@@ -181,6 +181,58 @@ class CTC_CRF(SequenceDist):
             current_states = idx[current_states, best_edges]
         
         return paths.T  # (N, T)
+
+    def viterbi_fused_guided(self, scores):
+        """
+        带后向引导的 Viterbi 解码：利用 β 分数引导前向选择
+        
+        思想类似 A* 搜索：
+        - f(edge) = g(到达来源的代价) + edge_score + h(从目标到终点的代价)
+        - 其中 h = β 是精确的剩余最优分数（不是启发式估计）
+        
+        Args:
+            scores: (T, N, C) 原始分数张量
+        Returns:
+            paths: (N, T) 解码路径，值为 0=blank, 1-4=ACGT
+        """
+        T, N, _ = scores.shape
+        n_states = self.n_base ** self.state_len
+        n_alphabet = len(self.alphabet)
+        
+        Ms = scores.reshape(T, N, n_states, n_alphabet)
+        device = scores.device
+        idx = self.idx.to(device=device, dtype=torch.long)
+        
+        # ========== 计算后向分数 (Max semiring) ==========
+        # betas[t, n, c] = 从状态 c 在时刻 t 出发到终点的最优分数
+        betas = self.backward_scores(scores, Log)  # (T+1, N, n_states)
+        
+        # ========== 构造引导分数 ==========
+        # guided_Ms[t, n, c, z] = Ms[t, n, c, z] + beta[t+1, n, c]
+        # 边分数 + 到达目标状态后的最优剩余分数
+        guided_Ms = Ms + betas[1:, :, :, None]  # (T, N, n_states, n_alphabet)
+        
+        # ========== Forward Pass (在引导分数上) ==========
+        alpha = torch.zeros(N, n_states, device=device, dtype=scores.dtype)
+        traceback = torch.zeros(T, N, n_states, dtype=torch.int8, device=device)
+        
+        for t in range(T):
+            prev_scores = alpha[:, idx]  # (N, C, NZ)
+            candidates = prev_scores + guided_Ms[t]  # (N, C, NZ)
+            alpha, best_z = candidates.max(dim=-1)  # (N, C)
+            traceback[t] = best_z.to(torch.int8)
+        
+        # ========== Backward Traceback ==========
+        current_states = alpha.argmax(dim=-1)  # (N,)
+        paths = torch.zeros(T, N, dtype=torch.int8, device=device)
+        batch_idx = torch.arange(N, device=device)
+        
+        for t in range(T - 1, -1, -1):
+            best_edges = traceback[t, batch_idx, current_states]
+            paths[t] = best_edges
+            current_states = idx[current_states, best_edges.long()]
+        
+        return paths.T.to(torch.long)  # (N, T)
 
     def path_to_str(self, path):
         alphabet = np.frombuffer("".join(self.alphabet).encode(), dtype="u1")
@@ -357,10 +409,11 @@ class seqdistModel(Module):
             # tracebacks = self.seqdist.viterbi(scores.log()).to(torch.int16).T
             # return [self.seqdist.path_to_str(path) for path in tracebacks.cpu().numpy()]
 
-            # Fallback to viterbi_fused (much faster than posteriors×2)
+            # # Fallback to viterbi_fused (much faster than posteriors×2)
             with torch.no_grad():
-                paths = self.seqdist.viterbi_fused(x.to(torch.float32))
+                paths = self.seqdist.viterbi_fused_guided(x.to(torch.float32))
             return [self.seqdist.path_to_str(path) for path in paths.cpu().numpy()]
+
 
     def get_path(self, x):
         with torch.no_grad():
