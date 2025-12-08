@@ -234,6 +234,79 @@ class CTC_CRF(SequenceDist):
         
         return paths.T.to(torch.long)  # (N, T)
 
+    def viterbi_fused_guided_fast(self, scores):
+        """
+        快速版带引导的 Viterbi（优化实现）
+        
+        使用转置索引正确计算后向分数：
+        - idx[c, z] 表示到达状态 c 的第 z 条入边的来源状态
+        - 后向计算需要从"出边"视角，因此需要对 idx 和 Ms 做转置
+        """
+        T, N, _ = scores.shape
+        n_states = self.n_base ** self.state_len
+        n_alphabet = len(self.alphabet)
+        
+        Ms = scores.reshape(T, N, n_states, n_alphabet)
+        device = scores.device
+        dtype = scores.dtype
+        idx = self.idx.to(device=device, dtype=torch.long)
+        
+        # ===== 构造转置索引（使用缓存）=====
+        # idx_T: 将 idx 按来源状态分组，idx_T[source, j] 是从 source 出发的第 j 条边在原始展平 idx 中的位置
+        # idx_T_targets: idx_T_targets[source, j] 是从 source 出发的第 j 条边到达的目标状态
+        if not hasattr(self, '_idx_T') or self._idx_T.device != device:
+            idx_T = idx.flatten().argsort().reshape(*idx.shape).to(device)  # (C, NZ)
+            idx_T_targets = idx_T // n_alphabet  # (C, NZ) - 目标状态
+            self._idx_T = idx_T
+            self._idx_T_targets = idx_T_targets
+        
+        idx_T = self._idx_T
+        idx_T_targets = self._idx_T_targets
+        
+        # ===== 后向遍历 =====
+        Ms_flat = Ms.reshape(T, N, -1)  # (T, N, C*NZ)
+        Ms_T = Ms_flat[:, :, idx_T]  # 转置后的 Ms: (T, N, C, NZ)，Ms_T[t, n, s, j] 是从状态 s 出发的第 j 条边的分数
+        
+        beta_next = torch.zeros(N, n_states, device=device, dtype=dtype)
+        betas_all = torch.zeros(T + 1, N, n_states, device=device, dtype=dtype)
+        
+        for t in range(T - 1, -1, -1):
+            # candidates[n, s, j] = Ms_T[t, n, s, j] + beta[t+1, n, target(s,j)]
+            # 即：从状态 s 发出第 j 条边的分数 + 到达目标状态后的剩余分数
+            candidates = Ms_T[t] + beta_next[:, idx_T_targets]  # (N, C, NZ)
+            
+            # Top-2 近似 logsumexp（向量化）
+            top2 = candidates.topk(2, dim=-1, sorted=False).values
+            max_val = top2.max(dim=-1).values
+            second_val = top2.min(dim=-1).values
+            beta_next = max_val + torch.nn.functional.softplus(second_val - max_val)
+            betas_all[t] = beta_next
+        
+        # ===== 前向遍历 + 引导 =====
+        # guided_Ms[t, n, c, z] = Ms[t, n, c, z] + beta[t+1, n, c]
+        # 边分数 + 到达状态 c 后的最优剩余分数
+        guided_Ms = Ms + betas_all[1:, :, :, None]
+        
+        alpha = torch.zeros(N, n_states, device=device, dtype=dtype)
+        traceback = torch.zeros(T, N, n_states, dtype=torch.int8, device=device)
+        
+        for t in range(T):
+            candidates = alpha[:, idx] + guided_Ms[t]
+            alpha, best_z = candidates.max(dim=-1)
+            traceback[t] = best_z.to(torch.int8)
+        
+        # ===== 回溯 =====
+        current_states = alpha.argmax(dim=-1)
+        paths = torch.zeros(T, N, dtype=torch.int8, device=device)
+        batch_idx = torch.arange(N, device=device)
+        
+        for t in range(T - 1, -1, -1):
+            best_edges = traceback[t, batch_idx, current_states]
+            paths[t] = best_edges
+            current_states = idx[current_states, best_edges.long()]
+        
+        return paths.T.to(torch.long)
+
     def path_to_str(self, path):
         alphabet = np.frombuffer("".join(self.alphabet).encode(), dtype="u1")
         seq = alphabet[path[path != 0]]
@@ -411,7 +484,7 @@ class seqdistModel(Module):
 
             # # Fallback to viterbi_fused (much faster than posteriors×2)
             with torch.no_grad():
-                paths = self.seqdist.viterbi_fused_guided(x.to(torch.float32))
+                paths = self.seqdist.viterbi_fused_guided_fast(x.to(torch.float32))
             return [self.seqdist.path_to_str(path) for path in paths.cpu().numpy()]
 
 
