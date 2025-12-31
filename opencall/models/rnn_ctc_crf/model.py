@@ -26,6 +26,8 @@ try:
 except ImportError:
     KOI_AVAILABLE = False
 
+import time
+
 
 def get_stride(m):
     if hasattr(m, "stride"):
@@ -35,6 +37,7 @@ def get_stride(m):
     if isinstance(m, Serial):
         return int(np.prod([get_stride(x) for x in m]))
     return 1
+
 
 
 class CTC_CRF(SequenceDist):
@@ -56,6 +59,37 @@ class CTC_CRF(SequenceDist):
 
     def n_score(self):
         return len(self.alphabet) * self.n_base ** (self.state_len)
+
+    def save_viterbi_inputs_with_precomputed(self, scores, out_paths, save_path="viterbi_inputs.pth"):
+        """
+        保存 viterbi_fused_guided_fast 函数的所有输入，包括预计算的固定索引
+        """
+        n_alphabet = len(self.alphabet)
+        idx = self.idx
+        
+        # 预计算转置索引
+        idx_T = idx.flatten().argsort().reshape(*idx.shape)  # (C, NZ)
+        idx_T_targets = idx_T // n_alphabet                   # (C, NZ) - 目标状态
+        
+        data = {
+            # 网络输入
+            'scores': scores.cpu(),
+
+            # 超参数
+            'n_base': self.n_base,
+            'state_len': self.state_len,
+            'alphabet': self.alphabet,
+            
+            # 固定索引
+            'idx': idx.cpu(),
+            'idx_T': idx_T.cpu(),
+            'idx_T_targets': idx_T_targets.cpu(),
+
+            # 算法输出
+            'path': out_paths.cpu(),
+        }
+        torch.save(data, save_path)
+        print(f"Saved viterbi inputs to {save_path}")
 
     def logZ(self, scores, S: semiring = Log):
         T, N, _ = scores.shape
@@ -267,19 +301,21 @@ class CTC_CRF(SequenceDist):
         Ms_flat = Ms.reshape(T, N, -1)  # (T, N, C*NZ)
         Ms_T = Ms_flat[:, :, idx_T]  # 转置后的 Ms: (T, N, C, NZ)，Ms_T[t, n, s, j] 是从状态 s 出发的第 j 条边的分数
         
-        beta_next = torch.zeros(N, n_states, device=device, dtype=dtype)
-        betas_all = torch.zeros(T + 1, N, n_states, device=device, dtype=dtype)
-        
+        beta_next = torch.zeros(N, n_states, device=device, dtype=torch.float32)
+        betas_all = torch.zeros(T + 1, N, n_states, device=device, dtype=torch.float32)
+
         for t in range(T - 1, -1, -1):
-            # candidates[n, s, j] = Ms_T[t, n, s, j] + beta[t+1, n, target(s,j)]
-            # 即：从状态 s 发出第 j 条边的分数 + 到达目标状态后的剩余分数
+            # 确保 Ms_T 和 idx_T_targets 相关的张量也是 bf16
             candidates = Ms_T[t] + beta_next[:, idx_T_targets]  # (N, C, NZ)
             
-            # Top-2 近似 logsumexp（向量化）
-            top2 = candidates.topk(2, dim=-1, sorted=False).values
-            max_val = top2.max(dim=-1).values
-            second_val = top2.min(dim=-1).values
-            beta_next = max_val + torch.nn.functional.softplus(second_val - max_val)
+            # 手动实现 logsumexp 以保持 bf16
+            # PyTorch 的 logsumexp 可能会内部转换为 fp32
+            max_val = candidates.float().max(dim=-1, keepdim=True)[0]
+            # clamp 防止 exp 溢出
+            exp_shifted = torch.exp((candidates - max_val).clamp(min=-30, max=30))
+            sum_exp = exp_shifted.sum(dim=-1, keepdim=True)
+            beta_next = (torch.log(sum_exp.clamp(min=1e-10)) + max_val).squeeze(-1)
+            
             betas_all[t] = beta_next
         
         # ===== 前向遍历 + 引导 =====
@@ -292,7 +328,7 @@ class CTC_CRF(SequenceDist):
         
         for t in range(T):
             candidates = alpha[:, idx] + guided_Ms[t]
-            alpha, best_z = candidates.max(dim=-1)
+            alpha, best_z = candidates.float().max(dim=-1)
             traceback[t] = best_z.to(torch.int8)
         
         # ===== 回溯 =====
@@ -304,7 +340,7 @@ class CTC_CRF(SequenceDist):
             best_edges = traceback[t, batch_idx, current_states]
             paths[t] = best_edges
             current_states = idx[current_states, best_edges.long()]
-        
+
         return paths.T.to(torch.long)
 
     def path_to_str(self, path):
@@ -484,7 +520,8 @@ class seqdistModel(Module):
 
             # # Fallback to viterbi_fused (much faster than posteriors×2)
             with torch.no_grad():
-                paths = self.seqdist.viterbi_fused_guided_fast(x.to(torch.float32))
+                # 明天先解决bf16推理的问题
+                paths = self.seqdist.viterbi_fused_guided_fast(x.to(torch.bfloat16))
             return [self.seqdist.path_to_str(path) for path in paths.cpu().numpy()]
 
 
