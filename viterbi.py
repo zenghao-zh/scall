@@ -2,10 +2,19 @@ import torch
 import numpy as np
 
 import torch.onnx
+import torch.nn.functional as F
 
-class SimpleMatMul(torch.nn.Module):
-    def forward(self, x, weight):
-        return torch.matmul(x, weight)
+class SimpleMatmul(torch.nn.Module):
+    def __init__(self, K=5120, N=5120):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.empty(N, K))  # 注意：推荐存 [N,K]，利于后端 dense
+        torch.nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, x):
+        # x: [1000, 256, 5120]
+        x2 = x.reshape(-1, x.shape[-1])          # [-1, K]
+        y2 = F.linear(x2, self.weight)           # y2 = x2 @ weight.T，输出 [-1, N]
+        return y2.reshape(*x.shape[:-1], -1)
 
 # self.n_base = 4
 # self.state_len = 5
@@ -13,11 +22,11 @@ class SimpleMatMul(torch.nn.Module):
 # scores.shape: [seqlen, batch_size, num_features] -> torch.Size([1000, 256, 5120])
 
 class Decoder:
-    def __init__(self, data_path='viterbi_inputs.pth', device = 'cuda:0'):
+    def __init__(self, data_path='viterbi_inputs.pth', device = 'cuda:0', dtype= torch.float32):
         data = torch.load(data_path)
 
         # 取出所有预计算值
-        self.scores = data['scores'].to(device)
+        self.scores = data['scores'].to(device=device, dtype=dtype)
         self.idx = data['idx'].to(device, dtype=torch.long)
         self._idx_T = data['idx_T'].to(device)
         self._idx_T_targets = data['idx_T_targets'].to(device)
@@ -25,7 +34,7 @@ class Decoder:
         self.state_len = data['state_len']
         self.alphabet = data['alphabet']
         self.true_paths = data['path'].to(device)
-        self._onnx_exported = False
+        self._onnx_exported = True
 
     def viterbi_fused_guided_fast(self, scores):
             """
@@ -63,30 +72,42 @@ class Decoder:
             mask = self._idx_T_mask
             Ms_T = torch.matmul(Ms_flat, mask).reshape(T, N, n_states, n_alphabet)  # 转置后的 Ms: (T, N, C, NZ)，Ms_T[t, n, s, j] 是从状态 s 出发的第 j 条边的分数
             if self._onnx_exported:
-                model = SimpleMatMul()
+                model = SimpleMatmul()
+                model.weight.data = mask
                 torch.onnx.export(
                     model,
-                    (Ms_flat, mask),
-                    "matmul.onnx",
+                    (Ms_flat),
+                    "huada_matmul_5120.onnx",
                     input_names=['input', 'weight'],
                     output_names=['output']
                 )
                 print(f"✓ Exported to matmul.onnx")
+                # 保存输入输出测试数据
+                # matmul_output = torch.matmul(Ms_flat, mask)
+                # torch.save({
+                #     'input': Ms_flat.cpu(),
+                #     'weight': mask.cpu(),
+                #     'output': matmul_output.cpu()
+                # }, 'huada_matmul_5120.pth')
+                # print(f"✓ Saved test data to matmul_test_data.pth")
+                
                 self._onnx_exported = False
 
                 
-            
             beta_next = torch.zeros(N, n_states, device=device, dtype=dtype)
             betas_all = torch.zeros(T + 1, N, n_states, device=device, dtype=dtype)
             
             for t in range(T - 1, -1, -1):
                 # candidates[n, s, j] = Ms_T[t, n, s, j] + beta[t+1, n, target(s,j)]
                 # 即：从状态 s 发出第 j 条边的分数 + 到达目标状态后的剩余分数
-                candidates = Ms_T[t] + beta_next[:, idx_T_targets]  # (N, C, NZ)
+                # 使用 F.embedding 替代索引操作，避免 gather/index_select 的硬件兼容性问题
+                # candidates = Ms_T[t] + beta_next[:, idx_T_targets]  # (N, C, NZ)
+                beta_indexed = torch.nn.functional.embedding(idx_T_targets, beta_next.T).permute(2, 0, 1)
+                candidates = Ms_T[t] + beta_indexed  # (N, C, NZ)
                 
                 # 精确 logsumexp
-                beta_next = torch.logsumexp(candidates, dim=-1)
-                betas_all[t] = beta_next
+                beta_next = torch.logsumexp(candidates.float(), dim=-1)
+                betas_all[t] = beta_next.to(dtype)
                 
             # ===== 前向遍历 + 引导 =====
             # guided_Ms[t, n, c, z] = Ms[t, n, c, z] + beta[t+1, n, c]
@@ -97,7 +118,11 @@ class Decoder:
             traceback = torch.zeros(T, N, n_states, dtype=torch.int8, device=device)
             
             for t in range(T):
-                candidates = alpha[:, idx] + guided_Ms[t]
+                # 使用 F.embedding 替代 alpha[:, idx] 索引操作
+                # alpha: (N, n_states), idx: (n_states, n_alphabet)
+                # 输出: (N, n_states, n_alphabet)
+                alpha_indexed = torch.nn.functional.embedding(idx, alpha.T).permute(2, 0, 1)
+                candidates = alpha_indexed + guided_Ms[t]
                 alpha, best_z = candidates.max(dim=-1)
                 traceback[t] = best_z.to(torch.int8)
             
