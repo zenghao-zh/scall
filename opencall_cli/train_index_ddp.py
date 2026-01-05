@@ -21,8 +21,11 @@ import random
 
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3, 4, 5, 6, 7'
-os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '23333'
+# MASTER_ADDR and MASTER_PORT are set by torchrun, only set defaults if not present
+if 'MASTER_ADDR' not in os.environ:
+    os.environ['MASTER_ADDR'] = 'localhost'
+if 'MASTER_PORT' not in os.environ:
+    os.environ['MASTER_PORT'] = '23333'
 
 def get_final_params_file_path(res_dir):
     weight_files = glob.glob(os.path.join(res_dir, "weights_*.tar"))
@@ -63,7 +66,9 @@ def main():
     torch.backends.cudnn.benchmark = False
 
     args = get_parser().parse_args()
-    local_rank = args.local_rank
+    # For torchrun compatibility: use LOCAL_RANK env var (set by torchrun), 
+    # fall back to --local_rank argument for backward compatibility
+    local_rank = int(os.environ.get('LOCAL_RANK', args.local_rank))
 
     # 1. init backend
     torch.cuda.set_device(local_rank)
@@ -218,7 +223,7 @@ def main():
                             else (0.01 * losses["loss"] + 0.99 * smoothed_loss)
                         )
                         log_writer.add_scalar("loss", smoothed_loss, step)
-                    if num % 10000 == 0:
+                    if num > 100 and num % 10000 == 0:
                         final_params_file_path = get_final_params_file_path(res_dir)
                         model_state = (
                             model.module.state_dict()

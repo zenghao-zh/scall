@@ -34,7 +34,7 @@ class Decoder:
         self.state_len = data['state_len']
         self.alphabet = data['alphabet']
         self.true_paths = data['path'].to(device)
-        self._onnx_exported = True
+        self._onnx_exported = False
 
     def viterbi_fused_guided_fast(self, scores):
             """
@@ -44,6 +44,7 @@ class Decoder:
             - idx[c, z] 表示到达状态 c 的第 z 条入边的来源状态
             - 后向计算需要从"出边"视角，因此需要对 idx 和 Ms 做转置
             """
+            # scores = scores.to(torch.bfloat16)
             T, N, _ = scores.shape
             n_states = self.n_base ** self.state_len
             n_alphabet = len(self.alphabet)
@@ -94,8 +95,8 @@ class Decoder:
                 self._onnx_exported = False
 
                 
-            beta_next = torch.zeros(N, n_states, device=device, dtype=dtype)
-            betas_all = torch.zeros(T + 1, N, n_states, device=device, dtype=dtype)
+            beta_next = torch.zeros(N, n_states, device=device, dtype=torch.float32)
+            betas_all = torch.zeros(T + 1, N, n_states, device=device, dtype=torch.float32)
             
             for t in range(T - 1, -1, -1):
                 # candidates[n, s, j] = Ms_T[t, n, s, j] + beta[t+1, n, target(s,j)]
@@ -114,7 +115,7 @@ class Decoder:
             # 边分数 + 到达状态 c 后的最优剩余分数
             guided_Ms = Ms + betas_all[1:, :, :, None]
             
-            alpha = torch.zeros(N, n_states, device=device, dtype=dtype)
+            alpha = torch.zeros(N, n_states, device=device, dtype=torch.float32)
             traceback = torch.zeros(T, N, n_states, dtype=torch.int8, device=device)
             
             for t in range(T):
@@ -123,7 +124,7 @@ class Decoder:
                 # 输出: (N, n_states, n_alphabet)
                 alpha_indexed = torch.nn.functional.embedding(idx, alpha.T).permute(2, 0, 1)
                 candidates = alpha_indexed + guided_Ms[t]
-                alpha, best_z = candidates.max(dim=-1)
+                alpha, best_z = candidates.float().max(dim=-1)
                 traceback[t] = best_z.to(torch.int8)
             
             # ===== 回溯 =====
