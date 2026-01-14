@@ -300,23 +300,37 @@ class CTC_CRF(SequenceDist):
         # ===== 后向遍历 =====
         Ms_flat = Ms.reshape(T, N, -1)  # (T, N, C*NZ)
         Ms_T = Ms_flat[:, :, idx_T]  # 转置后的 Ms: (T, N, C, NZ)，Ms_T[t, n, s, j] 是从状态 s 出发的第 j 条边的分数
-        
-        beta_next = torch.zeros(N, n_states, device=device, dtype=torch.float32)
-        betas_all = torch.zeros(T + 1, N, n_states, device=device, dtype=torch.float32)
+
+        segment_size = 25
+        betas_all = torch.zeros(T + 1, N, n_states, dtype=torch.bfloat16, device=device)
+        beta_next = torch.zeros(N, n_states, dtype=torch.bfloat16, device=device)
 
         for t in range(T - 1, -1, -1):
-            # 确保 Ms_T 和 idx_T_targets 相关的张量也是 bf16
-            candidates = Ms_T[t] + beta_next[:, idx_T_targets]  # (N, C, NZ)
+            candidates = Ms_T[t] + beta_next[:, idx_T_targets]
+            beta_next = torch.logsumexp(candidates, dim=-1)
             
-            # 手动实现 logsumexp 以保持 bf16
-            # PyTorch 的 logsumexp 可能会内部转换为 fp32
-            max_val = candidates.float().max(dim=-1, keepdim=True)[0]
-            # clamp 防止 exp 溢出
-            exp_shifted = torch.exp((candidates - max_val).clamp(min=-30, max=30))
-            sum_exp = exp_shifted.sum(dim=-1, keepdim=True)
-            beta_next = (torch.log(sum_exp.clamp(min=1e-10)) + max_val).squeeze(-1)
+            # 每10步归一化：减去最小值
+            if t % segment_size == 0:
+                beta_min = beta_next.min(dim=1, keepdim=True)[0]
+                beta_next = beta_next - beta_min  # 核心：保持相对关系
             
             betas_all[t] = beta_next
+        
+        # beta_next = torch.zeros(N, n_states, device=device, dtype=torch.float32)
+        # betas_all = torch.zeros(T + 1, N, n_states, device=device, dtype=torch.float32)
+
+        # for t in range(T - 1, -1, -1):
+        #     # 确保 Ms_T 和 idx_T_targets 相关的张量也是 bf16
+        #     candidates = Ms_T[t] + beta_next[:, idx_T_targets]  # (N, C, NZ)
+            
+        #     # 手动实现 logsumexp 以保持 bf16
+        #     # PyTorch 的 logsumexp 可能会内部转换为 fp32
+        #    #  beta_indexed = torch.nn.functional.embedding(idx_T_targets, beta_next.T).permute(2, 0, 1)
+        #    #  candidates = Ms_T[t] + beta_indexed  # (N, C, NZ)
+                
+        #         # 精确 logsumexp
+        #     beta_next = torch.logsumexp(candidates.float(), dim=-1)
+        #     betas_all[t] = beta_next
         
         # ===== 前向遍历 + 引导 =====
         # guided_Ms[t, n, c, z] = Ms[t, n, c, z] + beta[t+1, n, c]
