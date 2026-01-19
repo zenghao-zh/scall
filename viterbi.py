@@ -152,3 +152,93 @@ if __name__ == '__main__':
         print(f'⚠️  test viterbi_fused_guided_fast passed ({similarity * 100:.2f}% match)')
     else:
         print(f'❌ test viterbi_fused_guided_fast failed ({similarity * 100:.2f}% match)')
+
+
+# def viterbi_fused_guided_fast(self, scores):
+#         """
+#         快速版带引导的 Viterbi（优化实现）
+        
+#         使用转置索引正确计算后向分数：
+#         - idx[c, z] 表示到达状态 c 的第 z 条入边的来源状态
+#         - 后向计算需要从"出边"视角，因此需要对 idx 和 Ms 做转置
+#         """
+#         T, N, _ = scores.shape
+#         n_states = self.n_base ** self.state_len
+#         n_alphabet = len(self.alphabet)
+        
+#         Ms = scores.reshape(T, N, n_states, n_alphabet)
+#         device = scores.device
+#         dtype = scores.dtype
+#         idx = self.idx.to(device=device, dtype=torch.long)
+        
+#         # ===== 构造转置索引（使用缓存）=====
+#         # idx_T: 将 idx 按来源状态分组，idx_T[source, j] 是从 source 出发的第 j 条边在原始展平 idx 中的位置
+#         # idx_T_targets: idx_T_targets[source, j] 是从 source 出发的第 j 条边到达的目标状态
+#         if not hasattr(self, '_idx_T') or self._idx_T.device != device:
+#             idx_T = idx.flatten().argsort().reshape(*idx.shape).to(device)  # (C, NZ)
+#             idx_T_targets = idx_T // n_alphabet  # (C, NZ) - 目标状态
+#             self._idx_T = idx_T
+#             self._idx_T_targets = idx_T_targets
+        
+#         idx_T = self._idx_T
+#         idx_T_targets = self._idx_T_targets
+        
+#         # ===== 后向遍历 =====
+#         Ms_flat = Ms.reshape(T, N, -1)  # (T, N, C*NZ)
+#         Ms_T = Ms_flat[:, :, idx_T]  # 转置后的 Ms: (T, N, C, NZ)，Ms_T[t, n, s, j] 是从状态 s 出发的第 j 条边的分数
+
+#         segment_size = 10
+#         betas_all = torch.zeros(T + 1, N, n_states, dtype=torch.bfloat16, device=device)
+#         beta_next = torch.zeros(N, n_states, dtype=torch.bfloat16, device=device)
+
+#         for t in range(T - 1, -1, -1):
+#             candidates = Ms_T[t] + beta_next[:, idx_T_targets]
+#             beta_next = torch.logsumexp(candidates, dim=-1).bfloat16()
+            
+#             # 每10步归一化：减去最小值
+#             if t % segment_size == 0:
+#                 beta_min = beta_next.min(dim=1, keepdim=True)[0]
+#                 beta_next = beta_next - beta_min  # 核心：保持相对关系
+            
+#             betas_all[t] = beta_next
+        
+#         # beta_next = torch.zeros(N, n_states, device=device, dtype=torch.float32)
+#         # betas_all = torch.zeros(T + 1, N, n_states, device=device, dtype=torch.float32)
+
+#         # for t in range(T - 1, -1, -1):
+#         #     # 确保 Ms_T 和 idx_T_targets 相关的张量也是 bf16
+#         #     candidates = Ms_T[t] + beta_next[:, idx_T_targets]  # (N, C, NZ)
+            
+#         #     # 手动实现 logsumexp 以保持 bf16
+#         #     # PyTorch 的 logsumexp 可能会内部转换为 fp32
+#         #    #  beta_indexed = torch.nn.functional.embedding(idx_T_targets, beta_next.T).permute(2, 0, 1)
+#         #    #  candidates = Ms_T[t] + beta_indexed  # (N, C, NZ)
+                
+#         #         # 精确 logsumexp
+#         #     beta_next = torch.logsumexp(candidates.float(), dim=-1)
+#         #     betas_all[t] = beta_next
+        
+#         # ===== 前向遍历 + 引导 =====
+#         # guided_Ms[t, n, c, z] = Ms[t, n, c, z] + beta[t+1, n, c]
+#         # 边分数 + 到达状态 c 后的最优剩余分数
+#         guided_Ms = Ms + betas_all[1:, :, :, None]
+        
+#         alpha = torch.zeros(N, n_states, device=device, dtype=dtype)
+#         traceback = torch.zeros(T, N, n_states, dtype=torch.int8, device=device)
+        
+#         for t in range(T):
+#             candidates = alpha[:, idx] + guided_Ms[t]
+#             alpha, best_z = candidates.float().max(dim=-1)
+#             traceback[t] = best_z.to(torch.int8)
+        
+#         # ===== 回溯 =====
+#         current_states = alpha.argmax(dim=-1)
+#         paths = torch.zeros(T, N, dtype=torch.int8, device=device)
+#         batch_idx = torch.arange(N, device=device)
+        
+#         for t in range(T - 1, -1, -1):
+#             best_edges = traceback[t, batch_idx, current_states]
+#             paths[t] = best_edges
+#             current_states = idx[current_states, best_edges.long()]
+
+#         return paths.T.to(torch.long)

@@ -29,6 +29,27 @@ except ImportError:
 import time
 
 
+def manual_logsumexp(x, dim=-1, keepdim=False):
+    """
+    手动实现 logsumexp，数值稳定版本
+    
+    等价于: torch.logsumexp(x, dim=dim, keepdim=keepdim)
+    """
+    # 步骤1: 找到最大值（防止 exp 溢出）
+    x_max = x.max(dim=dim, keepdim=True)[0]
+    
+    # 步骤2: 减去最大值
+    x_shifted = x - x_max
+    
+    # 步骤3: exp -> sum -> log
+    result = x_max + torch.log(torch.sum(torch.exp(x_shifted), dim=dim, keepdim=True))
+    
+    # 步骤4: 处理 keepdim
+    if not keepdim:
+        result = result.squeeze(dim)
+    
+    return result
+
 def get_stride(m):
     if hasattr(m, "stride"):
         return m.stride if isinstance(m.stride, int) else m.stride[0]
@@ -301,13 +322,13 @@ class CTC_CRF(SequenceDist):
         Ms_flat = Ms.reshape(T, N, -1)  # (T, N, C*NZ)
         Ms_T = Ms_flat[:, :, idx_T]  # 转置后的 Ms: (T, N, C, NZ)，Ms_T[t, n, s, j] 是从状态 s 出发的第 j 条边的分数
 
-        segment_size = 25
+        segment_size = 10
         betas_all = torch.zeros(T + 1, N, n_states, dtype=torch.bfloat16, device=device)
         beta_next = torch.zeros(N, n_states, dtype=torch.bfloat16, device=device)
 
         for t in range(T - 1, -1, -1):
             candidates = Ms_T[t] + beta_next[:, idx_T_targets]
-            beta_next = torch.logsumexp(candidates, dim=-1)
+            beta_next = manual_logsumexp(candidates, dim=-1)
             
             # 每10步归一化：减去最小值
             if t % segment_size == 0:

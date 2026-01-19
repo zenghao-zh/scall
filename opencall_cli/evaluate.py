@@ -79,8 +79,46 @@ def get_parser():
         "--encoder_only", action="store_true", default=False,
         help="Use encoder-only mode"
     )
+    parser.add_argument(
+        "--check_sparsity", action="store_true", default=False,
+        help="Check and report model sparsity (useful for pruned models)"
+    )
+    parser.add_argument(
+        "--sparse_layers", type=str, default=None,
+        help="Comma-separated list of layer names to check sparsity (e.g., 'encoder.0.conv.weight,encoder.1.conv.weight')"
+    )
     
     return parser
+
+
+def calculate_model_sparsity(model, layer_names=None):
+    """
+    Calculate the sparsity of the model.
+    
+    Args:
+        model: The model to calculate sparsity for
+        layer_names: Optional list of layer names to check. If None, check all parameters.
+    
+    Returns:
+        tuple: (layer_sparsity_dict, total_sparsity)
+    """
+    total_params = 0
+    total_zeros = 0
+    layer_sparsity = {}
+    
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if layer_names is None or name in layer_names:
+                num_params = param.numel()
+                num_zeros = (param == 0).sum().item()
+                
+                if num_params > 0:
+                    layer_sparsity[name] = num_zeros / num_params
+                    total_params += num_params
+                    total_zeros += num_zeros
+    
+    total_sparsity = total_zeros / total_params if total_params > 0 else 0.0
+    return layer_sparsity, total_sparsity
 
 
 def main():
@@ -132,6 +170,47 @@ def main():
     if not os.path.exists(args.data_dir):
         raise FileNotFoundError(f"Data directory not found: {args.data_dir}")
     
+    # Determine device for evaluation
+    device_for_eval = device_id if device.startswith('cuda') else device
+    
+    # Initialize sparsity variables
+    layer_sparsity = {}
+    total_sparsity = 0.0
+    
+    # Check model sparsity if requested
+    if args.check_sparsity:
+        from opencall.utils.util import network
+        import toml
+        
+        log_func("Checking model sparsity...", log_path)
+        
+        # Load model to check sparsity
+        config = toml.load(config_path)
+        temp_device = device_for_eval if device.startswith('cuda') else 'cpu'
+        temp_model = network(config_path).to(temp_device)
+        temp_model.load_state_dict(torch.load(args.weight_path, map_location=device))
+        
+        # Parse sparse layer names if provided
+        sparse_layer_names = None
+        if args.sparse_layers:
+            sparse_layer_names = [name.strip() for name in args.sparse_layers.split(',')]
+        
+        layer_sparsity, total_sparsity = calculate_model_sparsity(temp_model, sparse_layer_names)
+        
+        log_func("", log_path)
+        log_func("{} {} {}".format("=" * 20, "MODEL SPARSITY", "=" * 20), log_path)
+        log_func(f"Total Sparsity: {total_sparsity:.4f} ({total_sparsity*100:.2f}%)", log_path)
+        log_func("Layer-wise Sparsity:", log_path)
+        for layer_name, sparsity in sorted(layer_sparsity.items()):
+            log_func(f"  {layer_name}: {sparsity:.4f} ({sparsity*100:.2f}%)", log_path)
+        log_func("{} {} {}".format("=" * 40, "", "=" * 0), log_path)
+        log_func("", log_path)
+        
+        # Clean up
+        del temp_model
+        if device.startswith('cuda'):
+            torch.cuda.empty_cache()
+    
     log_func("Loading validation data...", log_path)
     
     # Load validation data
@@ -143,8 +222,6 @@ def main():
     
     # Run evaluation
     log_func("Starting evaluation...", log_path)
-    
-    device_for_eval = device_id if device.startswith('cuda') else device
     
     res = model_eval(
         dataloader=valid_loader,
@@ -185,6 +262,11 @@ def main():
         'weight_path': args.weight_path,
         'data_dir': args.data_dir,
     }
+    
+    # Add sparsity information if checked
+    if args.check_sparsity:
+        results_dict['total_sparsity'] = round(total_sparsity, 4)
+        results_dict['layer_sparsity'] = {k: round(v, 4) for k, v in layer_sparsity.items()}
     
     output_json_path = os.path.join(output_dir, f"{args.output_name}.json")
     with open(output_json_path, 'w') as json_file:
