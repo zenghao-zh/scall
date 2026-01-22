@@ -190,95 +190,107 @@ class CTC_CRF(SequenceDist):
         paths = traceback.argmax(2) % len(self.alphabet)
         return paths
 
-    def viterbi_fused(self, scores):
-        """
-        融合的 Viterbi 解码：一次 forward 遍历 + traceback
-        Args:
-            scores: (T, N, C) 原始分数张量
-        Returns:
-            paths: (N, T) 解码路径，值为 0=blank, 1-4=ACGT
-        """
-        T, N, _ = scores.shape
-        n_states = self.n_base ** self.state_len
-        n_alphabet = len(self.alphabet)  # NZ = n_base + 1
-        
-        # Ms[t, n, c, z] = 在时间 t，从状态 idx[c,z] 转移到状态 c 的分数
-        Ms = scores.reshape(T, N, n_states, n_alphabet)
-        device = scores.device
-        idx = self.idx.to(device=device, dtype=torch.long)  # (C, NZ)
-        
-        # ========== Forward Pass ==========
-        # alpha[n, c] = 到达状态 c 的最优路径分数
-        alpha = torch.zeros(N, n_states, device=device, dtype=scores.dtype)
-        # traceback[t, n, c] = 在时间 t 到达状态 c 的最优边索引 z
-        traceback = torch.zeros(T, N, n_states, dtype=torch.long, device=device)
-        
-        for t in range(T):
-            # 获取所有入边的来源状态分数
-            # alpha[:, idx] 形状: (N, C, NZ)
-            prev_scores = alpha[:, idx]  # (N, C, NZ)
-            # 加上边分数: candidates[n, c, z] = alpha[n, idx[c,z]] + Ms[t, n, c, z]
-            candidates = prev_scores + Ms[t]  # (N, C, NZ)
-            # 对每个目标状态，选择最优的入边
-            alpha, traceback[t] = candidates.max(dim=-1)  # 都是 (N, C)
-        # ========== Backward Traceback ==========
-        # 找到终止时刻的最优状态
-        current_states = alpha.argmax(dim=-1)  # (N,)
-        # 回溯路径
-        paths = torch.zeros(T, N, dtype=torch.long, device=device)
-        batch_idx = torch.arange(N, device=device)
-        for t in range(T - 1, -1, -1):
-            # 获取到达 current_states 的最优边
-            best_edges = traceback[t, batch_idx, current_states]  # (N,)
-            # 边索引就是 action: 0=blank, 1=A, 2=C, 3=G, 4=T
-            paths[t] = best_edges
-            # 更新 current_states 为来源状态
-            current_states = idx[current_states, best_edges]
-        
-        return paths.T  # (N, T)
 
-    def viterbi_fused_guided(self, scores):
+    def viterbi_posteriors(self, scores):
         """
-        带后向引导的 Viterbi 解码：利用 β 分数引导前向选择
+        基于 posteriors 的 Viterbi 解码（完全展开版本）
         
-        思想类似 A* 搜索：
-        - f(edge) = g(到达来源的代价) + edge_score + h(从目标到终点的代价)
-        - 其中 h = β 是精确的剩余最优分数（不是启发式估计）
+        实现原始注释代码的逻辑：
+        post_scores = self.posteriors(x, Log) + 1e-8
+        paths = self.viterbi(post_scores.log())
         
-        Args:
-            scores: (T, N, C) 原始分数张量
-        Returns:
-            paths: (N, T) 解码路径，值为 0=blank, 1-4=ACGT
+        完全展开：
+        - posteriors(x, S) = grad(logZ(x, S)) 
+          = S.dsum(S.mul(alphas, betas))
+        - viterbi 就是 posteriors(x, Max).argmax
         """
         T, N, _ = scores.shape
         n_states = self.n_base ** self.state_len
         n_alphabet = len(self.alphabet)
-        
-        Ms = scores.reshape(T, N, n_states, n_alphabet)
         device = scores.device
         idx = self.idx.to(device=device, dtype=torch.long)
         
-        # ========== 计算后向分数 (Max semiring) ==========
-        # betas[t, n, c] = 从状态 c 在时刻 t 出发到终点的最优分数
-        betas = self.backward_scores(scores, Log)  # (T+1, N, n_states)
+        scores_float = scores.to(torch.float32)
+        Ms = scores_float.reshape(T, N, n_states, n_alphabet)
         
-        # ========== 构造引导分数 ==========
-        # guided_Ms[t, n, c, z] = Ms[t, n, c, z] + beta[t+1, n, c]
-        # 边分数 + 到达目标状态后的最优剩余分数
-        guided_Ms = Ms + betas[1:, :, :, None]  # (T, N, n_states, n_alphabet)
+        # 构造转置索引
+        if not hasattr(self, '_idx_T') or self._idx_T.device != device:
+            idx_T = idx.flatten().argsort().reshape(*idx.shape).to(device)
+            idx_T_targets = idx_T // n_alphabet
+            self._idx_T = idx_T
+            self._idx_T_targets = idx_T_targets
         
-        # ========== Forward Pass (在引导分数上) ==========
-        alpha = torch.zeros(N, n_states, device=device, dtype=scores.dtype)
+        idx_T = self._idx_T
+        idx_T_targets = self._idx_T_targets
+        Ms_flat = Ms.reshape(T, N, -1)
+        Ms_T = Ms_flat[:, :, idx_T]
+        
+        # ========================================
+        # 步骤1: posteriors(scores, Log)
+        # 根据 sparse.py backward 实现：
+        #   alphas = forward_scores(Ms, Log)  # 已在 forward 中计算
+        #   betas = backward_scores(Ms, Log)
+        #   grad = Log.mul(alphas, betas[1:])  # Log.mul = add
+        #   grad = Log.dsum(grad, dim=-1)      # Log.dsum = softmax
+        # ========================================
+        
+        # Forward pass (Log semiring: logsumexp)
+        alpha = torch.zeros(N, n_states, device=device, dtype=torch.float32)
+        alphas_all = [alpha.clone()]
+        
+        for t in range(T):
+            alpha_indexed = alpha[:, idx]
+            candidates = alpha_indexed + Ms[t]  # Log.mul = add
+            alpha = torch.logsumexp(candidates, dim=-1)  # Log.sum = logsumexp
+            alphas_all.append(alpha.clone())
+        
+        alphas_all = torch.stack(alphas_all, dim=0)
+        
+        # Backward pass (Log semiring: logsumexp)
+        beta = torch.zeros(N, n_states, device=device, dtype=torch.float32)
+        betas_all = [beta.clone()]
+        
+        for t in range(T - 1, -1, -1):
+            beta_indexed = beta[:, idx_T_targets]
+            candidates = Ms_T[t] + beta_indexed  # Log.mul = add
+            beta = torch.logsumexp(candidates, dim=-1)  # Log.sum = logsumexp
+            betas_all.append(beta.clone())
+        
+        betas_all = torch.stack(betas_all[::-1], dim=0)
+        
+        # 计算 posteriors (边缘概率)
+        # grad = alphas[t, idx[c,z]] + Ms[t,c,z] + betas[t+1,c]
+        edge_grad = torch.zeros(T, N, n_states, n_alphabet, device=device, dtype=torch.float32)
+        for t in range(T):
+            alpha_indexed = alphas_all[t][:, idx]
+            edge_grad[t] = alpha_indexed + Ms[t] + betas_all[t + 1][:, :, None]  # Log.mul = add
+        
+        # Log.dsum = softmax (归一化)
+        post_scores_reshaped = torch.softmax(edge_grad.reshape(T, N, -1), dim=2)  # Log.dsum
+        post_scores = post_scores_reshaped.reshape(T, N, n_states * n_alphabet) + 1e-8
+        
+        # ========================================
+        # 步骤2: viterbi(log(posteriors))
+        # Viterbi 只需要 Max semiring 的 forward pass + traceback
+        # 不需要 backward！
+        # ========================================
+        
+        log_post = torch.log(post_scores)
+        log_Ms = log_post.reshape(T, N, n_states, n_alphabet)
+        
+        # Viterbi forward pass (Max semiring: max)
+        alpha_max = torch.full((N, n_states), float('-inf'), device=device, dtype=torch.float32)
+        alpha_max[:, 0] = 0.0
         traceback = torch.zeros(T, N, n_states, dtype=torch.int8, device=device)
         
         for t in range(T):
-            prev_scores = alpha[:, idx]  # (N, C, NZ)
-            candidates = prev_scores + guided_Ms[t]  # (N, C, NZ)
-            alpha, best_z = candidates.max(dim=-1)  # (N, C)
+            alpha_indexed = alpha_max[:, idx]  # (N, n_states, n_alphabet)
+            candidates = alpha_indexed + log_Ms[t]  # Max.mul = add
+            alpha_max, best_z = candidates.max(dim=-1)  # Max.sum = max，同时记录 argmax
             traceback[t] = best_z.to(torch.int8)
         
-        # ========== Backward Traceback ==========
-        current_states = alpha.argmax(dim=-1)  # (N,)
+        # 回溯得到最优路径
+        current_states = alpha_max.argmax(dim=-1)  # 找到最优终止状态
         paths = torch.zeros(T, N, dtype=torch.int8, device=device)
         batch_idx = torch.arange(N, device=device)
         
@@ -287,7 +299,7 @@ class CTC_CRF(SequenceDist):
             paths[t] = best_edges
             current_states = idx[current_states, best_edges.long()]
         
-        return paths.T.to(torch.long)  # (N, T)
+        return paths.T.to(torch.long)
 
     def viterbi_fused_guided_fast(self, scores):
         """
@@ -337,25 +349,6 @@ class CTC_CRF(SequenceDist):
             
             betas_all[t] = beta_next
         
-        # beta_next = torch.zeros(N, n_states, device=device, dtype=torch.float32)
-        # betas_all = torch.zeros(T + 1, N, n_states, device=device, dtype=torch.float32)
-
-        # for t in range(T - 1, -1, -1):
-        #     # 确保 Ms_T 和 idx_T_targets 相关的张量也是 bf16
-        #     candidates = Ms_T[t] + beta_next[:, idx_T_targets]  # (N, C, NZ)
-            
-        #     # 手动实现 logsumexp 以保持 bf16
-        #     # PyTorch 的 logsumexp 可能会内部转换为 fp32
-        #    #  beta_indexed = torch.nn.functional.embedding(idx_T_targets, beta_next.T).permute(2, 0, 1)
-        #    #  candidates = Ms_T[t] + beta_indexed  # (N, C, NZ)
-                
-        #         # 精确 logsumexp
-        #     beta_next = torch.logsumexp(candidates.float(), dim=-1)
-        #     betas_all[t] = beta_next
-        
-        # ===== 前向遍历 + 引导 =====
-        # guided_Ms[t, n, c, z] = Ms[t, n, c, z] + beta[t+1, n, c]
-        # 边分数 + 到达状态 c 后的最优剩余分数
         guided_Ms = Ms + betas_all[1:, :, :, None]
         
         alpha = torch.zeros(N, n_states, device=device, dtype=dtype)
@@ -455,20 +448,36 @@ def rnn_encoder(
     blank_score=None,
     expand_blanks=True,
     num_layers=5,
+    bidirectional=False,
 ):
-    rnn = layers[rnn_type]
-    return Serial(
-        [
+    """
+    RNN encoder with optional bidirectional LSTM.
+    
+    Args:
+        bidirectional: If True, use BiLSTM. Note that each BiLSTM layer will use
+                      features//2 hidden size, so output remains features-dimensional.
+    """
+    if bidirectional and rnn_type == "lstm":
+        rnn = layers["bilstm"]
+        # For BiLSTM, use half hidden size so output is features-dimensional
+        hidden_size = features // 2
+        sublayers = [
             conv(insize, 4, ks=5, bias=True, activation=activation),
             conv(4, 16, ks=5, bias=True, activation=activation),
             conv(
                 16, features, ks=winlen, stride=stride, bias=True, activation=activation
             ),
             Permute([2, 0, 1]),
-            *(
-                rnn(features, features, reverse=(num_layers - i) % 2, dropout=dropout)
-                for i in range(num_layers)
-            ),
+        ]
+        # First BiLSTM layer takes features as input, outputs 2*hidden_size=features
+        # Note: In this codebase, LSTM(size, insize) creates lstm with hidden_size=insize, input_size=size
+        # So BiLSTM(size=features, insize=hidden_size) gives hidden_size=hidden_size, input_size=features
+        sublayers.append(rnn(features, hidden_size, dropout=dropout))
+        # Subsequent layers take features (2*hidden_size) as input
+        for i in range(1, num_layers):
+            sublayers.append(rnn(features, hidden_size, dropout=dropout))
+        
+        sublayers.append(
             LinearCRFEncoder(
                 features,
                 n_base,
@@ -477,9 +486,35 @@ def rnn_encoder(
                 scale=scale,
                 blank_score=blank_score,
                 expand_blanks=expand_blanks,
-            ),
-        ]
-    )
+            )
+        )
+        return Serial(sublayers)
+    else:
+        # Original unidirectional LSTM
+        rnn = layers[rnn_type]
+        return Serial(
+            [
+                conv(insize, 4, ks=5, bias=True, activation=activation),
+                conv(4, 16, ks=5, bias=True, activation=activation),
+                conv(
+                    16, features, ks=winlen, stride=stride, bias=True, activation=activation
+                ),
+                Permute([2, 0, 1]),
+                *(
+                    rnn(features, features, reverse=(num_layers - i) % 2, dropout=dropout)
+                    for i in range(num_layers)
+                ),
+                LinearCRFEncoder(
+                    features,
+                    n_base,
+                    state_len,
+                    activation="tanh",
+                    scale=scale,
+                    blank_score=blank_score,
+                    expand_blanks=expand_blanks,
+                ),
+            ]
+        )
 
 
 class seqdistModel(Module):
@@ -493,7 +528,7 @@ class seqdistModel(Module):
     def forward(self, x):
         return self.encoder(x)
 
-    def decode_batch(self, x, beam_width=1, beam_cut=100, scale=1.0, offset=0.0, blank_score=2.0, use_koi=False):
+    def decode_batch(self, x, beam_width=10, beam_cut=100, scale=1.0, offset=0.0, blank_score=2.0, use_koi=False):
         """
         Decode a batch of scores using either koi beam_search or viterbi decoding.
         
@@ -549,14 +584,14 @@ class seqdistModel(Module):
             
             return results
         else:           # Fallback to viterbi decoding
-            # scores = self.seqdist.posteriors(x.to(torch.float32)) + 1e-8
-            # tracebacks = self.seqdist.viterbi(scores.log()).to(torch.int16).T
-            # return [self.seqdist.path_to_str(path) for path in tracebacks.cpu().numpy()]
+            # 方法1: 基于 posteriors 的 Viterbi（原始方法，更准确但较慢）
+            # with torch.no_grad():
+            #     paths = self.seqdist.viterbi_posteriors(x.to(torch.float32))
+            # return [self.seqdist.path_to_str(path) for path in paths.cpu().numpy()]
 
-            # # Fallback to viterbi_fused (much faster than posteriors×2)
+            # 方法2: viterbi_fused_guided_fast（快速版本，推荐使用）
             with torch.no_grad():
-                # 明天先解决bf16推理的问题
-                paths = self.seqdist.viterbi_fused_guided_fast(x.to(torch.bfloat16))
+                paths = self.seqdist.viterbi_posteriors(x.to(torch.float32))
             return [self.seqdist.path_to_str(path) for path in paths.cpu().numpy()]
 
 
