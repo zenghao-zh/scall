@@ -2,6 +2,7 @@
 opencall CTC-CRF Model.
 """
 
+from numpy.core.arrayprint import dtype_is_implied
 import torch
 import numpy as np
 from opencall.models.common.nn import (
@@ -58,8 +59,6 @@ def get_stride(m):
     if isinstance(m, Serial):
         return int(np.prod([get_stride(x) for x in m]))
     return 1
-
-
 
 class CTC_CRF(SequenceDist):
     def __init__(self, state_len, alphabet):
@@ -299,7 +298,7 @@ class CTC_CRF(SequenceDist):
         
         return paths.T.to(torch.long)
 
-    def viterbi_guided_bidirectional(self, scores, use_bfloat16=False):
+    def viterbi_guided_bidirectional(self, scores, use_bfloat16=True):
         """
         双向引导 Viterbi（精度和速度的平衡，支持 bfloat16）
         
@@ -321,6 +320,15 @@ class CTC_CRF(SequenceDist):
         Args:
             scores: 输入分数 (T, N, C)
             use_bfloat16: 是否使用 bfloat16 计算（默认 False，使用 float32）
+
+        具体参数值：
+            - T = 1000
+            - N = 512 (batch size)
+            - n_states = 1024
+            - self.state_len = 5 
+            - self.n_base = 4
+
+
         """
         T, N, _ = scores.shape
         n_states = self.n_base ** self.state_len
@@ -357,15 +365,10 @@ class CTC_CRF(SequenceDist):
         for t in range(T):
             alpha_indexed = alpha[:, idx]
             candidates = alpha_indexed + Ms[t]
-            if use_bfloat16:
-                # bfloat16: 使用 manual_logsumexp
-                alpha = manual_logsumexp(candidates, dim=-1)
-            else:
-                # float32: 使用标准 logsumexp (更精确)
-                alpha = torch.logsumexp(candidates, dim=-1)
+            alpha = torch.logsumexp(candidates, dim=-1)
             
             # 每 segment_size 步归一化（保持数值稳定）
-            if t % segment_size == 0 and t > 0:
+            if t % segment_size == 0:
                 alpha_min = alpha.min(dim=1, keepdim=True)[0]
                 alpha = alpha - alpha_min
             
@@ -380,12 +383,7 @@ class CTC_CRF(SequenceDist):
         for t in range(T - 1, -1, -1):
             beta_indexed = beta[:, idx_T_targets]
             candidates = Ms_T[t] + beta_indexed
-            if use_bfloat16:
-                # bfloat16: 使用 manual_logsumexp
-                beta = manual_logsumexp(candidates, dim=-1)
-            else:
-                # float32: 使用标准 logsumexp (更精确)
-                beta = torch.logsumexp(candidates, dim=-1)
+            beta = torch.logsumexp(candidates, dim=-1)
             
             # 每 segment_size 步归一化（保持数值稳定）
             if t % segment_size == 0:
@@ -398,7 +396,7 @@ class CTC_CRF(SequenceDist):
         # 步骤3 + 4: 融合计算引导分数并做 Viterbi forward
         # 避免额外的内存分配，直接在线计算
         # ========================================
-        alpha_max = torch.full((N, n_states), float('-inf'), device=device, dtype=torch.float32)
+        alpha_max = torch.full((N, n_states), float('-inf'), device=device, dtype=dtype)
         alpha_max[:, 0] = 0.0
         traceback = torch.zeros(T, N, n_states, dtype=torch.int8, device=device)
         
@@ -411,11 +409,14 @@ class CTC_CRF(SequenceDist):
             # Viterbi forward: alpha_max[dst] = max(alpha_max[src] + guided_scores)
             alpha_indexed_max = alpha_max[:, idx]
             candidates = alpha_indexed_max + guided_scores_t
-            alpha_max, best_z = candidates.float().max(dim=-1)  # 用 float 保证精度
+            alpha_max, best_z = candidates.max(dim=-1)  # 用 float 保证精度
             traceback[t] = best_z.to(torch.int8)
-        
+
+            if t % 5 == 0:
+                alpha_max = alpha_max-alpha_max.max(dim=-1, keepdim=True)[0]
+
         # ========================================
-        # 步骤5: 回溯得到最优路径
+        # 步骤5: 回溯得到最优路径 (CPU)
         # ========================================
         current_states = alpha_max.argmax(dim=-1)
         paths = torch.zeros(T, N, dtype=torch.int8, device=device)
@@ -477,14 +478,29 @@ class CTC_CRF(SequenceDist):
             betas_all[t] = beta_next
         
         guided_Ms = Ms + betas_all[1:, :, :, None]
+        # guided_Ms = guided_Ms /50
         
+        # device = "cpu"
+        # guided_Ms = guided_Ms.to(device)
+        # idx = idx.to(device)
+
+
+        #t0 = time.time()
         alpha = torch.zeros(N, n_states, device=device, dtype=dtype)
         traceback = torch.zeros(T, N, n_states, dtype=torch.int8, device=device)
+
         
         for t in range(T):
             candidates = alpha[:, idx] + guided_Ms[t]
-            alpha, best_z = candidates.float().max(dim=-1)
+            alpha, best_z = candidates.max(dim=-1)
             traceback[t] = best_z.to(torch.int8)
+
+            if t % 5 == 0:
+                alpha = alpha-alpha.max(dim=-1, keepdim=True)[0]
+
+
+       # t1 = time.time()
+        # print(f"First Loop Time taken: {t1 - t0} seconds")
         
         # ===== 回溯 =====
         current_states = alpha.argmax(dim=-1)
@@ -495,6 +511,9 @@ class CTC_CRF(SequenceDist):
             best_edges = traceback[t, batch_idx, current_states]
             paths[t] = best_edges
             current_states = idx[current_states, best_edges.long()]
+        #t2 = time.time()
+        #print(f"Second LoopTime taken: {t2 - t1} seconds")
+       # print(f"Total Time taken: {t2 - t0} seconds")
 
         return paths.T.to(torch.long)
 
@@ -655,7 +674,7 @@ class seqdistModel(Module):
     def forward(self, x):
         return self.encoder(x)
 
-    def decode_batch(self, x, beam_width=10, beam_cut=100, scale=1.0, offset=0.0, blank_score=2.0, use_koi=False, viterbi_method='bidirectional', use_bfloat16=True):
+    def decode_batch(self, x, beam_width=10, beam_cut=100, scale=1.0, offset=0.0, blank_score=2.0, use_koi=True, viterbi_method='bidirectional', use_bfloat16=True):
         """
         Decode a batch of scores using either koi beam_search or viterbi decoding.
         
