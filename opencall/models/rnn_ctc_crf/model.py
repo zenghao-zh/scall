@@ -674,7 +674,7 @@ class seqdistModel(Module):
     def forward(self, x):
         return self.encoder(x)
 
-    def decode_batch(self, x, beam_width=10, beam_cut=100, scale=1.0, offset=0.0, blank_score=2.0, use_koi=True, viterbi_method='bidirectional', use_bfloat16=True):
+    def decode_batch(self, x, beam_width=10, beam_cut=100, scale=1.0, offset=0.0, blank_score=2.0, use_koi=False, viterbi_method='bidirectional', use_bfloat16=True):
         """
         Decode a batch of scores using either koi beam_search or viterbi decoding.
         
