@@ -23,7 +23,7 @@ find_free_port() {
 }
 MASTER_PORT=${MASTER_PORT:-$(find_free_port)}
 
-torchrun --nproc_per_node=$GPU_NUMS \
+CUDA_VISIBLE_DEVICES="0,1,2,3" torchrun --nproc_per_node=$GPU_NUMS \
 	--master_port=$MASTER_PORT \
 	train_index_ddp_sparse.py  \
 	--data_dir $DATA_DIR \

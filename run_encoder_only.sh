@@ -3,7 +3,7 @@ bash scripts/train_index_ddp_encoder_only.sh 2 /workspace/huada/hg002_label_for_
 
 bash scripts/train_index_ddp.sh 4 /workspace/huada/all_refs_label_for_ctc/train_data/train xxxxx 256 0.0004 10000000000 0 20 lstm_ctc_crf 200 lstm_ctc_crf_kmer
 
-bash scripts/train_index_ddp_sparse.sh 8 /workspace/huada/all_refs_label_for_ctc/train_data/train xxxxx 256 0.0004 10000000000 0 10 lstm_ctc_crf 200 lstm_ctc_crf_kmer
+bash scripts/train_index_ddp_sparse.sh 4 /workspace/huada/all_refs_label_for_ctc/train_data/train xxxxx 256 0.0004 10000000000 0 20 lstm_ctc_crf 200 lstm_ctc_crf_kmer_0129_l9-6x-woL
 
 bash scripts/train_index_ddp_sparse_distill.sh \
     4 \
