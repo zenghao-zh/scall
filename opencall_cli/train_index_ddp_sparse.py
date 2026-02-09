@@ -5,7 +5,7 @@ sys.path.append(pro_dir)
 
 import glob
 import re
-from opencall.utils.util import model_eval, init, network, get_dataset_in_one_dir, get_lr_scheduler, log_func
+from opencall.utils.util import model_eval, init, network, get_dataset_in_one_dir,  get_lr_scheduler, log_func
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from datetime import timedelta

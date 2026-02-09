@@ -424,6 +424,103 @@ def get_dataset_in_one_dir(args, dist=True, encoder_only=False):
     return train_loader, valid_loader
 
 
+def get_dataset_from_pt(args, dist=True):
+    """
+    从预转换的数据文件加载数据集 (高效版本)
+    
+    支持两种格式:
+    - pt: PyTorch Tensor 格式 (快速, 支持预加载)
+    - memmap: NumPy 内存映射格式 (最快, 适合超大数据集)
+    
+    Args:
+        args: 包含 data_dir, batch_size, val_batch_size 等参数
+        dist: 是否使用分布式采样器
+    
+    Returns:
+        train_loader, valid_loader
+    """
+    from opencall.data_loader.data import FastDataset
+    from torch.utils.data import Subset
+    
+    print("[loading data from optimized format]")
+    
+    train_dir = args.data_dir
+    val_dir = os.path.join(os.path.dirname(args.data_dir), 'val')
+    
+    # 加载数据集 (FastDataset 会自动检测格式)
+    # preload=False 避免多进程重复加载导致内存爆炸
+    train_dataset = FastDataset(train_dir, preload=False)
+    
+    # 验证集大小限制
+    val_size = getattr(args, 'val_size', 20000)
+    
+    # 验证集可选
+    if os.path.exists(val_dir):
+        valid_dataset = FastDataset(val_dir, preload=False)
+        # 如果验证集太大，截取一部分
+        if len(valid_dataset) > val_size:
+            print(f"[Info] Limiting validation set from {len(valid_dataset)} to {val_size}")
+            valid_dataset = Subset(valid_dataset, range(val_size))
+    else:
+        print(f"[Warning] Validation directory not found: {val_dir}")
+        print(f"[Info] Using last {val_size} samples from train data for validation")
+        # 从训练集末尾取一部分作为验证集
+        total_len = len(train_dataset)
+        val_size = min(val_size, total_len // 10)  # 最多取 10% 作为验证
+        val_indices = range(total_len - val_size, total_len)
+        valid_dataset = Subset(train_dataset, val_indices)
+    
+    print(f"train_dataset: {len(train_dataset)}")
+    print(f"valid_dataset: {len(valid_dataset)}")
+    
+    # 获取 num_workers 参数
+    # memmap 格式数据读取很快，不需要太多 workers
+    num_workers = getattr(args, 'num_workers', 2)
+    
+    # 检测数据格式，memmap 格式建议使用较少的 workers
+    is_memmap = hasattr(train_dataset, '_dataset') and hasattr(train_dataset._dataset, 'signals')
+    if is_memmap and num_workers > 4:
+        print(f"[Info] memmap format detected, reducing num_workers from {num_workers} to 2")
+        num_workers = 2
+    
+    if dist:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            num_workers=num_workers,
+            sampler=train_sampler,
+            pin_memory=True,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+            drop_last=True,  # DDP 训练建议 drop_last 避免不均匀 batch
+        )
+    else:
+        from torch.utils.data import RandomSampler
+        train_sampler = RandomSampler(train_dataset)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            num_workers=num_workers,
+            sampler=train_sampler,
+            pin_memory=True,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+        )
+    
+    valid_loader = torch.utils.data.DataLoader(
+        valid_dataset,
+        batch_size=args.val_batch_size,
+        shuffle=False,
+        num_workers=min(num_workers, 2),  # 验证集不需要太多 workers
+        pin_memory=True,
+        prefetch_factor=2 if num_workers > 0 else None,
+        persistent_workers=False,  # 验证不频繁，不需要 persistent
+    )
+    
+    return train_loader, valid_loader
+
+
 
 def get_lr_scheduler(
     epochs, optimizer, data_len, last_epoch=0, end_ratio=0.01, warmup_steps=100

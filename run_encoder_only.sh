@@ -21,3 +21,18 @@ bash scripts/train_index_ddp_sparse_distill.sh \
     3.0 \
     0.1 \
     kl
+
+python opencall_cli/convert_hdf5_to_pt.py --input_dir /workspace/huada/all_refs_label_for_ctc/train_data/train --output_dir /workspace/huada/train_data_pt/train
+
+CUDA_VISIBLE_DEVICES="0,1,2,3" torchrun --nproc_per_node=4 /workspace/huada/scall/opencall_cli/train_fast.py \
+    --data_dir /workspace/huada/train_data_memmap/train \
+    --data_type pt \
+    --batch_size 256 \
+    --lr 0.0004 \
+    --epoch_num 20 \
+    --model lstm_ctc_crf \
+    --output_name lstm_ctc_crf_optimized \
+    --num_workers 2 \
+    --log_interval 10 \
+    --warmup_steps 200 \
+    --prune_log ./6x_cgb256_prune

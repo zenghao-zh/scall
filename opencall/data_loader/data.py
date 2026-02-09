@@ -1474,3 +1474,282 @@ class DataSetMultiV2(IterableDataset):
                     seqs_orig = refs + 1  # cuz the refs is from 0~3
                     indata = cur
                     seqs = np.full((self.maxlen,), 0)
+
+# ============================================================================
+# 高效数据加载类 - 使用预转换的 .pt 文件
+# ============================================================================
+
+class ChunkedPTDataset(Dataset):
+    """
+    高效的数据集类，读取预转换的 .pt 文件格式。
+    
+    相比 HDF5 格式的优势：
+    - 支持多进程 DataLoader (num_workers > 0)
+    - 加载速度快 3-5 倍
+    - 无需每次访问都进行 I/O 操作
+    
+    使用方法：
+    1. 先用 convert_hdf5_to_pt.py 转换数据
+    2. 然后使用此类加载数据
+    
+    Args:
+        data_dir: 包含 .pt 文件和 metadata.pt 的目录
+        cache_chunks: 缓存的 chunk 数量 (None = 全部缓存到内存)
+    """
+    
+    def __init__(self, data_dir, cache_chunks=None):
+        self.data_dir = data_dir
+        self.cache_chunks = cache_chunks
+        
+        # 加载元数据
+        metadata_path = os.path.join(data_dir, 'metadata.pt')
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+        
+        self.metadata = torch.load(metadata_path)
+        self.total_samples = self.metadata['total_samples']
+        self.num_chunks = self.metadata['num_chunks']
+        self.chunk_size = self.metadata['chunk_size']
+        self.signal_len = self.metadata['signal_len']
+        self.maxlen = self.metadata['maxlen']
+        
+        # 获取所有 chunk 文件
+        self.chunk_files = sorted(glob.glob(os.path.join(data_dir, 'chunk_*.pt')))
+        
+        # 计算每个 chunk 的实际大小
+        self.chunk_sizes = []
+        self.chunk_offsets = [0]
+        
+        for chunk_file in self.chunk_files:
+            chunk_data = torch.load(chunk_file)
+            size = len(chunk_data['seqlens'])
+            self.chunk_sizes.append(size)
+            self.chunk_offsets.append(self.chunk_offsets[-1] + size)
+        
+        self.total_samples = self.chunk_offsets[-1]
+        
+        # 缓存机制
+        self._cache = {}
+        self._cache_order = []
+        
+        # 如果指定缓存所有，则预加载
+        if cache_chunks is None or cache_chunks >= len(self.chunk_files):
+            print(f"Preloading all {len(self.chunk_files)} chunks to memory...")
+            for i, chunk_file in enumerate(self.chunk_files):
+                self._cache[i] = torch.load(chunk_file)
+    
+    def _get_chunk_and_local_idx(self, global_idx):
+        """根据全局索引找到对应的 chunk 和 chunk 内的局部索引"""
+        for chunk_idx in range(len(self.chunk_sizes)):
+            if global_idx < self.chunk_offsets[chunk_idx + 1]:
+                local_idx = global_idx - self.chunk_offsets[chunk_idx]
+                return chunk_idx, local_idx
+        raise IndexError(f"Index {global_idx} out of range")
+    
+    def _load_chunk(self, chunk_idx):
+        """加载指定的 chunk，使用 LRU 缓存策略"""
+        if chunk_idx in self._cache:
+            return self._cache[chunk_idx]
+        
+        chunk_data = torch.load(self.chunk_files[chunk_idx])
+        
+        # 如果启用了缓存限制
+        if self.cache_chunks is not None:
+            # LRU 淘汰
+            if len(self._cache) >= self.cache_chunks:
+                oldest = self._cache_order.pop(0)
+                del self._cache[oldest]
+            
+            self._cache[chunk_idx] = chunk_data
+            self._cache_order.append(chunk_idx)
+        
+        return chunk_data
+    
+    def __getitem__(self, idx):
+        chunk_idx, local_idx = self._get_chunk_and_local_idx(idx)
+        chunk_data = self._load_chunk(chunk_idx)
+        
+        signal = chunk_data['signals'][local_idx]  # (1, signal_len)
+        seq = chunk_data['seqs'][local_idx]  # (maxlen,)
+        seqlen = chunk_data['seqlens'][local_idx]  # scalar
+        
+        return signal.numpy(), seq.numpy(), seqlen.item()
+    
+    def __len__(self):
+        return self.total_samples
+
+
+class ShuffledChunkedPTDataset(Dataset):
+    """
+    支持跨 epoch shuffle 的高效数据集类。
+    
+    在每个 epoch 开始时调用 shuffle(seed) 来打乱数据顺序。
+    内部使用索引映射实现快速 shuffle，无需实际移动数据。
+    
+    Args:
+        data_dir: 包含 .pt 文件和 metadata.pt 的目录
+        preload: 是否预加载所有数据到内存
+    """
+    
+    def __init__(self, data_dir, preload=True):
+        self.data_dir = data_dir
+        
+        # 加载元数据
+        metadata_path = os.path.join(data_dir, 'metadata.pt')
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+        
+        self.metadata = torch.load(metadata_path)
+        self.signal_len = self.metadata['signal_len']
+        self.maxlen = self.metadata['maxlen']
+        
+        # 获取所有 chunk 文件
+        self.chunk_files = sorted(glob.glob(os.path.join(data_dir, 'chunk_*.pt')))
+        
+        # 预加载所有数据（如果启用）
+        if preload:
+            print(f"Preloading {len(self.chunk_files)} chunks to memory...")
+            all_signals = []
+            all_seqs = []
+            all_seqlens = []
+            
+            for chunk_file in self.chunk_files:
+                chunk_data = torch.load(chunk_file)
+                all_signals.append(chunk_data['signals'])
+                all_seqs.append(chunk_data['seqs'])
+                all_seqlens.append(chunk_data['seqlens'])
+            
+            self.signals = torch.cat(all_signals, dim=0)
+            self.seqs = torch.cat(all_seqs, dim=0)
+            self.seqlens = torch.cat(all_seqlens, dim=0)
+            self.preloaded = True
+            print(f"Loaded {len(self.signals)} samples")
+        else:
+            # 延迟加载模式
+            self.preloaded = False
+            self._base_dataset = ChunkedPTDataset(data_dir, cache_chunks=10)
+        
+        self.total_samples = len(self.signals) if preload else len(self._base_dataset)
+        
+        # 初始化索引映射（用于 shuffle）
+        self.indices = np.arange(self.total_samples)
+    
+    def shuffle(self, seed):
+        """打乱数据顺序"""
+        rng = np.random.RandomState(seed)
+        rng.shuffle(self.indices)
+    
+    def __getitem__(self, idx):
+        actual_idx = self.indices[idx]
+        
+        if self.preloaded:
+            signal = self.signals[actual_idx]  # (1, signal_len)
+            seq = self.seqs[actual_idx]  # (maxlen,)
+            seqlen = self.seqlens[actual_idx]  # scalar
+            return signal.numpy(), seq.numpy(), seqlen.item()
+        else:
+            return self._base_dataset[actual_idx]
+    
+    def __len__(self):
+        return self.total_samples
+
+
+class MemmapDataset(Dataset):
+    """
+    基于 NumPy memmap 的超高速数据集类。
+    
+    特点:
+    - 近乎即时的初始化 (不需要加载全部数据)
+    - 按需读取，内存友好
+    - 支持超大数据集 (TB 级别)
+    
+    Args:
+        data_dir: 包含 memmap 文件的目录 (signals.npy, seqs.npy, seqlens.npy, metadata.json)
+    """
+    
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        
+        # 加载元数据
+        import json
+        metadata_path = os.path.join(data_dir, 'metadata.json')
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+        
+        with open(metadata_path, 'r') as f:
+            self.metadata = json.load(f)
+        
+        self.total_samples = self.metadata['total_samples']
+        self.signal_len = self.metadata['signal_len']
+        self.maxlen = self.metadata['maxlen']
+        
+        # 以 memmap 模式打开文件 (近乎即时)
+        self.signals = np.load(os.path.join(data_dir, 'signals.npy'), mmap_mode='r')
+        self.seqs = np.load(os.path.join(data_dir, 'seqs.npy'), mmap_mode='r')
+        self.seqlens = np.load(os.path.join(data_dir, 'seqlens.npy'), mmap_mode='r')
+        
+        # 初始化索引映射（用于 shuffle）
+        self.indices = np.arange(self.total_samples)
+        
+        print(f"[MemmapDataset] Loaded {self.total_samples} samples (memmap mode)")
+    
+    def shuffle(self, seed):
+        """打乱数据顺序"""
+        rng = np.random.RandomState(seed)
+        rng.shuffle(self.indices)
+    
+    def __getitem__(self, idx):
+        actual_idx = self.indices[idx]
+        
+        # memmap 会按需读取，非常高效
+        signal = self.signals[actual_idx].copy()  # (1, signal_len)
+        seq = self.seqs[actual_idx].copy()  # (maxlen,)
+        seqlen = int(self.seqlens[actual_idx])
+        
+        return signal, seq, seqlen
+    
+    def __len__(self):
+        return self.total_samples
+
+
+class FastDataset(Dataset):
+    """
+    自动检测并使用最优数据格式的数据集类。
+    
+    支持:
+    - memmap 格式 (最快，内存友好，适合超大数据集)
+    - pt 格式 (快速，可选预加载)
+    
+    Args:
+        data_dir: 数据目录
+        preload: 对于 pt 格式，是否预加载到内存 (memmap 格式忽略此参数)
+    """
+    
+    def __init__(self, data_dir, preload=False):
+        self.data_dir = data_dir
+        
+        # 检测数据格式
+        if os.path.exists(os.path.join(data_dir, 'metadata.json')):
+            # memmap 格式 - 始终内存友好
+            print(f"[FastDataset] Detected memmap format (memory-efficient)")
+            self._dataset = MemmapDataset(data_dir)
+        elif os.path.exists(os.path.join(data_dir, 'metadata.pt')):
+            # pt 格式 - 可选预加载
+            print(f"[FastDataset] Detected pt format (preload={preload})")
+            self._dataset = ShuffledChunkedPTDataset(data_dir, preload=preload)
+        else:
+            raise FileNotFoundError(f"No valid dataset found in {data_dir}")
+        
+        self.total_samples = len(self._dataset)
+        self.signal_len = self._dataset.signal_len
+        self.maxlen = self._dataset.maxlen
+    
+    def shuffle(self, seed):
+        """打乱数据顺序"""
+        self._dataset.shuffle(seed)
+    
+    def __getitem__(self, idx):
+        return self._dataset[idx]
+    
+    def __len__(self):
+        return self.total_samples

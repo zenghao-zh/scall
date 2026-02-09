@@ -43,4 +43,3 @@ CUDA_VISIBLE_DEVICES="0,1,2,3" torchrun --nproc_per_node=$GPU_NUMS \
 #  bash scripts/train_index_ddp_sparse.sh 4 /workspace/huada/train_data/train /workspace/huada/models/wy_basic_v0.3/weights_0.tar 64 0.0004 10000000000 0 3 lstm_ctc_crf 200 wy_basic_v0.3_12x_sparse
 #  bash scripts/train_index_ddp_sparse.sh 2 /workspace/huada/train_data/train /workspace/huada/task_results/wy_basic_v0.3_12x_sparse_3epoch/weights_0.tar 64 0.0004 10000000000 0 3 lstm_ctc_crf 200 wy_basic_v0.3_12x_sparse
 #  bash scripts/train_index_ddp_sparse.sh 2 /workspace/huada/train_data/train xxxxx 32 0.0004 100000 0 1 lstm_ctc_crf 200 050328
-
