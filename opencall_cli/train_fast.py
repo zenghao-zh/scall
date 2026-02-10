@@ -410,6 +410,16 @@ class Trainer:
             finetune=False,
             pruner_resume_dict=pruner_resume_dict,
         )
+        
+        # Resume 时将 global_step 同步给 pruner
+        # PrunerScheduler.step 和 Trainer.global_step 是 1:1 递增的，
+        # 但 pruner 没有独立的 save/load，所以利用已保存的 global_step 恢复
+        if self.args.resume and self.global_step > 0 and pruner_resume_dict is None:
+            self.pruner.step = self.global_step
+            self.pruner.resume_tag = True
+            self.pruner.init_pruner()
+            if self.is_main_process:
+                print(f"[Resume] Synced pruner step to global_step={self.global_step}")
     
     def _setup_checkpoint(self):
         """初始化检查点管理器"""
