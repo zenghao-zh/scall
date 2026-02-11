@@ -5,6 +5,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from opencall.models.common.nn import LSTM
 from opencall.utils.util import network
+import re
 
 
 class FakeQuant(torch.nn.Module):
@@ -54,6 +55,15 @@ def load_io_quant_model(config_file, io_quant_path, act_scales_path, device="cpu
     # 3. 加载量化后的 state_dict
     state_dict = torch.load(io_quant_path, map_location=device)
     model.load_state_dict(state_dict)
+
+
+    # new_state_dict = {}
+    # for k, v in state_dict.items():
+    #     # encoder.X.0.rnn.* -> encoder.X.rnn.*
+    #     new_key = re.sub(r'(encoder\.\d+)\.0\.(rnn\.)', r'\1.\2', k)
+    #     new_state_dict[new_key] = v
+    # state_dict = new_state_dict
+
     model.eval()
 
     return model, act_scales
@@ -61,8 +71,8 @@ def load_io_quant_model(config_file, io_quant_path, act_scales_path, device="cpu
 
 if __name__ == "__main__":
     config_file = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/config.toml'
-    io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/io_quant.pth'
-    act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/act_scales.pth'
+    io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/layer_9_6x_io_quant.pth'
+    act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/layer_9_6x_act_scales.pth'
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     model, act_scales = load_io_quant_model(config_file, io_quant_path, act_scales_path, device)

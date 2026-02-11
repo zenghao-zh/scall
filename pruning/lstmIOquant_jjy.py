@@ -101,8 +101,8 @@ def hook_model(model, act_scales):
 def main():
     config_file = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/config.toml'
     pretrained_model_file = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/weights_59.tar'
-    act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/act_scales.pth'
-    io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/io_quant.pth'
+    act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/layer_9_6x_act_scales.pth'
+    io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/layer_9_6x_io_quant.pth'
 
     # 构建模型
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -119,8 +119,8 @@ def main():
     data_dir = '/workspace/huada/all_refs_label_for_ctc/train_data/train'
     dataset = TrainingDataSet3(data_dir, tokenization="kmer")
     # 校准只需少量数据，取前2000条
-    if len(dataset) > 2000:
-        dataset = torch.utils.data.Subset(dataset, range(2000))
+    if len(dataset) > 20000:
+        dataset = torch.utils.data.Subset(dataset, range(20000))
     val_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=4, pin_memory=True, shuffle=False)
 
     act_scales = dict()
@@ -143,6 +143,10 @@ def main():
     
     torch.save(act_scales,act_scales_path)
     torch.save(model.state_dict(), io_quant_path)
+
+
+    ## remove .0
+    
 
    
 
