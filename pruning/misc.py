@@ -84,6 +84,9 @@ def generate_prune_dict(model,sparsity, seq_len: int=None):
             if 768 in parameter.shape:
                 set_up_info['cgb'][name]=256
                 set_up_info['dtype'][name] = 'bf16'
+                # if 4096 in parameter.shape:
+                #     set_up_info['cgb'][name] = 32
+                #     set_up_info['dtype'][name] = 'bf16'
             else:
                 set_up_info['cgb'][name] = 512
                 set_up_info['dtype'][name] = 'int8'

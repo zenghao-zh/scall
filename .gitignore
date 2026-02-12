@@ -82,8 +82,18 @@ opencall/evaluation/mapping_optim_v1/build
 *.fastq
 *.sam
 *.swp
+*.fast5
 
 # data
 data/
 train_data/
 *.so
+
+# Python build artifacts
+*.egg-info/
+*.egg
+dist/
+build/
+
+# macOS
+.DS_Store

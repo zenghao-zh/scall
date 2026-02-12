@@ -1,0 +1,6 @@
+toml==0.10.2
+torch==2.0.1+cu118
+numpy==1.23.5
+parasail==1.2
+h5py==3.2.1
+scikit-learn==0.24.1
