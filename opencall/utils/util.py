@@ -176,26 +176,30 @@ def loading_hd5_two_time(args, data_dir, batch_size, gen_dataloader=True):
 
     # 1) loading hd5 and get train/val data
     print("loading hd5 ...")
-    hd5_path = "{}/{}.hd5".format(data_dir, os.path.basename(data_dir))
-    index_train_path = "{}/{}_train.npy".format(data_dir, os.path.basename(data_dir))
-    index_val_path = "{}/{}_val.npy".format(data_dir, os.path.basename(data_dir))
-    train_dataset = TrainingDataSet2(
-        hd5_path, index_train_path, limit_size=args.limit_train_size, tokenization=args.tokenization, 
-    )
-    test_dataset = TestingDataSet2(
-        hd5_path, index_val_path, limit_size=args.val_size, tokenization=args.tokenization
-    )
-    print("train_dataset: {}".format(len(train_dataset)))
+    if os.path.basename(data_dir) == 'train':
+        train_dataset_orig = TrainingDataSet3(data_dir, tokenization=args.tokenization)
+        test_dataset = TrainingDataSet3(os.path.join(os.path.dirname(data_dir), 'val'), tokenization=args.tokenization)
+    else:
+        hd5_path = "{}/{}.hd5".format(data_dir, os.path.basename(data_dir))
+        index_train_path = "{}/{}_train.npy".format(data_dir, os.path.basename(data_dir))
+        index_val_path = "{}/{}_val.npy".format(data_dir, os.path.basename(data_dir))
+        train_dataset_orig = TrainingDataSet2(hd5_path, index_train_path, tokenization=args.tokenization)
+        test_dataset = TrainingDataSet2(hd5_path, index_val_path, tokenization=args.tokenization)
+    print("train_dataset: {}".format(len(train_dataset_orig)))
     print("test_dataset: {}".format(len(test_dataset)))
-
-    # 2) gen dataloader
+    # 2) trim training data
+    if args.limit_train_size > 0:
+        if args.limit_train_size < len(train_dataset_orig):
+            train_dataset, _ = torch.utils.data.random_split(
+                train_dataset_orig, [args.limit_train_size, len(train_dataset_orig)-args.limit_train_size])
+        else:
+            train_dataset = train_dataset_orig
+    else:
+        train_dataset = train_dataset_orig
+    # 3) gen dataloader
     if gen_dataloader:
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=batch_size, num_workers=args.num_wk, pin_memory=True
-        )
-        valid_loader = torch.utils.data.DataLoader(
-            test_dataset, batch_size=batch_size, num_workers=1, pin_memory=True
-        )
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True )
+        valid_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
         return train_loader, valid_loader
     else:
         return train_dataset, test_dataset
@@ -368,20 +372,31 @@ def network(config_path):
 
 def get_dataset(args):
     print("[loading data]")
+    # train_loader_kwargs, valid_loader_kwargs = load_numpy(
+    #     args.limit_train_size, args.data_dir, args.part_num
+    # )
+    # loader_kwargs = {
+    #     "batch_size": args.batch_size, "num_workers": 4, "pin_memory": True
+    # }
+    # train_dataset = train_loader_kwargs.get("dataset")
+
     train_dataset, valid_dataset = loading_hd5_two_time(
         args, args.data_dir, args.batch_size, gen_dataloader=False
     )
 
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        num_workers=args.num_wk,
+        num_workers=8,
+        sampler=train_sampler,
         pin_memory=True,
     )
     valid_loader = torch.utils.data.DataLoader(
         valid_dataset,
         batch_size=args.val_batch_size,
-        num_workers=args.num_wk,
+        shuffle=False,
+        num_workers=4,
         pin_memory=True,
     )
     return train_loader, valid_loader
@@ -445,7 +460,7 @@ def get_dataset_from_pt(args, dist=True):
     print("[loading data from optimized format]")
     
     train_dir = args.data_dir
-    val_dir = os.path.join(os.path.dirname(args.data_dir), 'val')
+    val_dir = os.path.join(os.path.dirname(args.data_dir), 'val_mmap')
     
     # 加载数据集 (FastDataset 会自动检测格式)
     # preload=False 避免多进程重复加载导致内存爆炸

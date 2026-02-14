@@ -402,7 +402,7 @@ class Trainer:
             num_steps=total_steps,
             prune_freq=500,
             log_freq=500,
-            seq_len=5000,
+            seq_len=4796,
             sparsities=sparsity_list,
             rank=self.global_rank,
             bank_size=64,

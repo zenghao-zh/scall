@@ -5,7 +5,7 @@ sys.path.append(pro_dir)
 
 import glob
 import re
-from opencall.utils.util import model_eval, init, network, get_dataset_in_one_dir, get_lr_scheduler, log_func
+from opencall.utils.util import model_eval, init, network, get_dataset, get_lr_scheduler, log_func
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import datetime
@@ -98,7 +98,7 @@ def main():
         # split idx file, make preparation for data loading
 
     # 3. get data
-    train_loader, valid_loader = get_dataset_in_one_dir(args)
+    train_loader, valid_loader = get_dataset(args)
     data_len = len(train_loader)
     if dist.get_rank() == 0:
         log_func("data len: {}".format(data_len), log_path)

@@ -331,12 +331,8 @@ class TestingDataSet2(IterableDataset):
 
 class TrainingDataSet3(Dataset):
     def __init__(self, data_dir, tokenization):
-        self._load_hd5_npy(data_dir)
         self.tokenization = tokenization
-
-    def shuffle(self, seed):
-        random.Random(seed).shuffle(self.region_np)
-
+        self._load_hd5_npy(data_dir)
 
     def _load_hd5_npy(self, data_dir):
         # npy_path = '/workspace/basecall_data/train_data/wt_hac_r2.1.1-20240325'
@@ -352,29 +348,15 @@ class TrainingDataSet3(Dataset):
                 continue
             self.hd5_list.append(hd5_file)
             dat_npy = np.load(f"{os.path.dirname(hd5_dir[i])}/{os.path.basename(hd5_dir[i]).split('.')[0]}.npy")
-            last_row = dat_npy[-1:]
-            data_rows = dat_npy[:-1]
-            mask = data_rows[:,5] == 0
-            filtered_data = data_rows[mask]
-            if filtered_data.shape[0] == 0:
-                continue
-            dat_npy = filtered_data
-            if last_row[0, 0] > self.maxlen:
-                self.maxlen = int(last_row[0, 0])
+            if dat_npy.shape[1] == 5:
+                dat_npy = np.column_stack((dat_npy, np.array([0]*dat_npy.shape[0])))
+            if dat_npy[-1, 0] > self.maxlen:
+                self.maxlen = int(dat_npy[-1, 0])
             dat_npy = np.column_stack((dat_npy, np.array([hd5_num]*dat_npy.shape[0])))
-            npy_list.append(dat_npy)
+            npy_list.append(dat_npy[0:-1, :])
             hd5_num += 1
         dat_np = np.concatenate(npy_list, axis = 0).astype(int)
-        
-        # Copy dat_np 5 times, shuffle each with different seed, then concatenate
-        # shuffled_copies = []
-        # for i in range(5):
-        #     shuffled_copy = utils.shuffle(dat_np, random_state=i)
-        #     shuffled_copies.append(shuffled_copy)
-        
-        # self.region_np = np.concatenate(shuffled_copies, axis=0)
         self.region_np = utils.shuffle(dat_np, random_state=0)
-
 
     def _load_hd5(self, read_index, cur_start, cur_end, ref_start, ref_end, hd5_index):
         hd5_file = self.hd5_list[hd5_index]
@@ -382,12 +364,9 @@ class TrainingDataSet3(Dataset):
         batch_num = int(read_index // per_num)
         read = hd5_file['batch_{}'.format(batch_num)][str(read_index)]
         cur = self._get_current(read, (cur_start, cur_end), standardize=True)
-        #ref_start2 = min((ref_start + 10), (ref_end-1))
-        #ref_end2 = max(1, (ref_end - 10))
-        ref_start2 = ref_start
-        ref_end2 = ref_end
+        ref_start2 = ref_start + 0
+        ref_end2 = ref_end - 0
         refs = read['Seq'][ref_start2:ref_end2]
-        del read
         return cur, refs
     
     def _get_signal(self, read, region=None):
@@ -405,17 +384,7 @@ class TrainingDataSet3(Dataset):
 
     def __getitem__(self, index):
         read_index, cur_start, cur_end, ref_start, ref_end, is_first_chunk, hd5_index = self.region_np[index, :].tolist()
-        try:
-            cur, refs = self._load_hd5(read_index, cur_start, cur_end, ref_start, ref_end, hd5_index)
-        except Exception as e:
-            hd5_file = self.hd5_list[hd5_index]
-            per_num = hd5_file.attrs['batch_size']
-            batch_num = int(read_index // per_num)
-            read = hd5_file['batch_{}'.format(batch_num)]
-            print(f"Error loading HD5 file: {e}")
-            print(f"Read index: {read_index}, HD5 file: {hd5_file.filename}")
-            return None, None, None
-
+        cur, refs = self._load_hd5(read_index, cur_start, cur_end, ref_start, ref_end, hd5_index)
 
         if self.tokenization == "flipflop":
             seqs_orig = flipflopfings.flipflop_code(refs, 4)

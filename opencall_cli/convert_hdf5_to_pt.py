@@ -116,10 +116,10 @@ def process_file_to_arrays(args):
 
 
 def get_maxlen(input_dir):
-    """获取 maxlen"""
+    """获取 maxlen (扫描所有 npy 文件)"""
     npy_files = glob.glob(f'{input_dir}/*.npy')
     maxlen = 0
-    for npy_path in npy_files[:20]:
+    for npy_path in npy_files:
         try:
             dat_npy = np.load(npy_path)
             if dat_npy[-1, 0] > maxlen:
