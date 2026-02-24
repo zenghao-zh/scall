@@ -3,8 +3,8 @@ Self-contained Viterbi evaluation script.
 
 Usage:
     python /workspace/huada/scall/viterbi_0211.py \
-    --model_dir /workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67 \
-    --data_dir /workspace/huada/all_refs_label_for_ctc/train_data/val \
+    --model_dir /workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214 \
+    --data_dir /workspace/huada/moffett_data/250F600274011_train_data/val \
     --device cuda:0 \
     --val_batch_size 64 \
     --seed 25
@@ -23,6 +23,7 @@ import torch
 from torch.nn import Module
 from torch.nn.init import orthogonal_
 from torch.utils.data import Dataset, DataLoader
+from sklearn import utils
 import numpy as np
 import parasail
 
@@ -76,6 +77,27 @@ def truncated_normal(size, dtype=torch.float32, device=None, num_resample=5):
     x = torch.empty(size + (num_resample,), dtype=torch.float32, device=device).normal_()
     i = ((x < 2) & (x > -2)).max(-1, keepdim=True)[1]
     return torch.clamp_(x.gather(-1, i).squeeze(-1), -2, 2)
+
+def manual_logsumexp(x, dim=-1, keepdim=False):
+    """
+    手动实现 logsumexp，数值稳定版本
+    
+    等价于: torch.logsumexp(x, dim=dim, keepdim=keepdim)
+    """
+    # 步骤1: 找到最大值（防止 exp 溢出）
+    x_max = x.max(dim=dim, keepdim=True)[0]
+    
+    # 步骤2: 减去最大值
+    x_shifted = x - x_max
+    
+    # 步骤3: exp -> sum -> log
+    result = x_max + torch.log2(torch.sum(torch.exp(x_shifted), dim=dim, keepdim=True))
+    
+    # 步骤4: 处理 keepdim
+    if not keepdim:
+        result = result.squeeze(dim)
+    
+    return result
 
 class RNNWrapper(Module):
     def __init__(self, rnn_type, *args, reverse=False, orthogonal_weight_init=True,
@@ -290,13 +312,13 @@ class CTC_CRF:
         idx_T = self._idx_T
         idx_T_targets = self._idx_T_targets
         Ms_T = Ms.reshape(T, -1, N)[:, idx_T, :]
-        segment_size = 10
+        segment_size = 8
 
         # Forward
         alphas_all = torch.zeros(T + 1, n_states, N, device=device, dtype=dtype)
         alpha = alphas_all[0]
         for t in range(T):
-            alpha = torch.logsumexp(alpha[idx, :] + Ms[t], dim=1)
+            alpha = manual_logsumexp(alpha[idx, :] + Ms[t], dim=1)
             if t % segment_size == 0:
                 alpha = alpha - alpha.min(dim=0, keepdim=True)[0]
             alphas_all[t + 1] = alpha
@@ -305,7 +327,7 @@ class CTC_CRF:
         betas_all = torch.zeros(T + 1, n_states, N, device=device, dtype=dtype)
         beta = betas_all[T]
         for t in range(T - 1, -1, -1):
-            beta = torch.logsumexp(Ms_T[t] + beta[idx_T_targets, :], dim=1)
+            beta = manual_logsumexp(Ms_T[t] + beta[idx_T_targets, :], dim=1)
             if t % segment_size == 0:
                 beta = beta - beta.min(dim=0, keepdim=True)[0]
             betas_all[t] = beta
@@ -318,7 +340,7 @@ class CTC_CRF:
             guided = alphas_all[t][idx, :] + Ms[t] + betas_all[t + 1][:, None, :]
             alpha_max, best_z = (alpha_max[idx, :] + guided).max(dim=1)
             traceback[t] = best_z.to(torch.int8)
-            if t % 5 == 0:
+            if t % segment_size == 0:
                 alpha_max = alpha_max - alpha_max.max(dim=0, keepdim=True)[0]
 
         # Traceback
@@ -444,6 +466,10 @@ from sklearn import utils as sk_utils
 class TrainingDataSet3(Dataset):
     def __init__(self, data_dir, tokenization):
         self.tokenization = tokenization
+        self._load_hd5_npy(data_dir)
+
+    def _load_hd5_npy(self, data_dir):
+        # npy_path = '/workspace/basecall_data/train_data/wt_hac_r2.1.1-20240325'
         self.maxlen = 0
         hd5_dir = glob.glob(f'{data_dir}/*.hd5')
         self.hd5_list = []
@@ -452,44 +478,66 @@ class TrainingDataSet3(Dataset):
         for i in range(len(hd5_dir)):
             try:
                 hd5_file = h5py.File(hd5_dir[i], 'r')
-            except Exception:
+            except Exception as e:
                 continue
             self.hd5_list.append(hd5_file)
             dat_npy = np.load(f"{os.path.dirname(hd5_dir[i])}/{os.path.basename(hd5_dir[i]).split('.')[0]}.npy")
-            last_row = dat_npy[-1:]
-            data_rows = dat_npy[:-1]
-            filtered_data = data_rows[data_rows[:, 5] == 0]
-            if filtered_data.shape[0] == 0:
-                continue
-            if last_row[0, 0] > self.maxlen:
-                self.maxlen = int(last_row[0, 0])
-            dat_npy = np.column_stack((filtered_data, np.full(filtered_data.shape[0], hd5_num)))
-            npy_list.append(dat_npy)
+            if dat_npy.shape[1] == 5:
+                dat_npy = np.column_stack((dat_npy, np.array([0]*dat_npy.shape[0])))
+            if dat_npy[-1, 0] > self.maxlen:
+                self.maxlen = int(dat_npy[-1, 0])
+            dat_npy = np.column_stack((dat_npy, np.array([hd5_num]*dat_npy.shape[0])))
+            npy_list.append(dat_npy[0:-1, :])
             hd5_num += 1
-        self.region_np = sk_utils.shuffle(np.concatenate(npy_list, axis=0).astype(int), random_state=0)
+        dat_np = np.concatenate(npy_list, axis = 0).astype(int)
+        self.region_np = utils.shuffle(dat_np, random_state=0)
 
     def _load_hd5(self, read_index, cur_start, cur_end, ref_start, ref_end, hd5_index):
         hd5_file = self.hd5_list[hd5_index]
         per_num = hd5_file.attrs['batch_size']
-        read = hd5_file[f'batch_{int(read_index // per_num)}'][str(read_index)]
-        signal = read['Signal'][cur_start:cur_end]
-        cur = (signal + read.attrs['offset']) * read.attrs['range'] / read.attrs['digitisation']
-        cur = (cur - read.attrs['shift_frompA']) / read.attrs['scale_frompA']
-        refs = read['Seq'][ref_start:ref_end]
+        batch_num = int(read_index // per_num)
+        read = hd5_file['batch_{}'.format(batch_num)][str(read_index)]
+        cur = self._get_current(read, (cur_start, cur_end), standardize=True)
+        ref_start2 = ref_start + 0
+        ref_end2 = ref_end - 0
+        refs = read['Seq'][ref_start2:ref_end2]
         return cur, refs
+    
+    def _get_signal(self, read, region=None):
+        if region is None:
+            return read['Signal']
+        a, b = region
+        return read['Signal'][a:b]
+
+    def _get_current(self, read, region=None, standardize=True):
+        signal = self._get_signal(read, region)
+        current = (signal + read.attrs['offset']) * read.attrs['range'] / read.attrs['digitisation']
+        if standardize:
+            current = (current - read.attrs['shift_frompA']) / read.attrs['scale_frompA']
+        return current
 
     def __getitem__(self, index):
-        read_index, cur_start, cur_end, ref_start, ref_end, _, hd5_index = self.region_np[index, :].tolist()
-        try:
-            cur, refs = self._load_hd5(read_index, cur_start, cur_end, ref_start, ref_end, hd5_index)
-        except Exception as e:
-            print(f"Error loading HD5: {e}, read_index={read_index}")
-            return None, None, None
-        seqs_orig = refs + 1
-        seqs = np.zeros(self.maxlen, dtype=np.float32)
+        read_index, cur_start, cur_end, ref_start, ref_end, is_first_chunk, hd5_index = self.region_np[index, :].tolist()
+        cur, refs = self._load_hd5(read_index, cur_start, cur_end, ref_start, ref_end, hd5_index)
+
+        if self.tokenization == "flipflop":
+            seqs_orig = flipflopfings.flipflop_code(refs, 4)
+            indata = cur.astype(np.float32)
+            seqs = np.full((self.maxlen,), -1)
+        elif self.tokenization == "kmer":
+            seqs_orig = refs + 1
+            indata = cur
+            seqs = np.full((self.maxlen,), 0)
+        else:
+            seqs_orig = refs + 1
+            indata = cur
+            seqs = np.full((self.maxlen,), 0)
+
         seqs[:len(seqs_orig)] = seqs_orig
-        indata = cur[np.newaxis, :].astype(np.float32)
-        return indata, seqs, len(seqs_orig)
+        seqlen = len(seqs_orig)
+        indata = np.expand_dims(indata, axis=1).transpose((1, 0))  # CT
+
+        return indata.astype(np.float32), seqs, seqlen
 
     def __len__(self):
         return self.region_np.shape[0]
@@ -503,13 +551,12 @@ def model_eval(dataloader, model, is_half, device):
     targets, seqs = [], []
     t0 = time.perf_counter()
     total_samples = 0
-    accuracy_with_cov = lambda ref, seq: accuracy(ref, seq, min_coverage=0.85)
+    accuracy_with_cov = lambda ref, seq: accuracy(ref, seq, min_coverage=0.95)
 
     with torch.no_grad():
         for data, target, *_ in dataloader:
             targets.extend(torch.unbind(target, 0))
             data = data.type(torch.float16).to(device) if is_half else data.to(device)
-            data = data[..., 102:4898] ## 适配墨芯卡，直接截取中间4796个特征
             total_samples += data.shape[0] * data.shape[2]
 
             # backbone (CNN + LSTM) → crfencoder (LinearCRFEncoder) → viterbi decode

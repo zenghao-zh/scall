@@ -259,7 +259,15 @@ def get_last_checkpoint(dirname):
     weight_files = glob(os.path.join(dirname, "weights_*.tar"))
     if not weight_files:
         raise FileNotFoundError("no model weights found in '%s'" % dirname)
-    weights = max([int(re.sub(".*_([0-9]+).tar", "\\1", w)) for w in weight_files])
+    # filter out non-numeric weight files like weights_best.tar
+    numeric_weights = []
+    for w in weight_files:
+        m = re.search(r"weights_(\d+)\.tar$", w)
+        if m:
+            numeric_weights.append(int(m.group(1)))
+    if not numeric_weights:
+        raise FileNotFoundError("no numeric model weights found in '%s'" % dirname)
+    weights = max(numeric_weights)
     return os.path.join(dirname, 'weights_%s.tar' % weights)
 
 

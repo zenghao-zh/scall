@@ -11,7 +11,7 @@ def main():
     parser.add_argument("--model_dir", default="/workspace/huada/task_results/lstm_ctc_crf_optimized_l10_6x_0204")
     parser.add_argument("--weights", default=None, help="weight file name, e.g. weights_59.tar")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--chunksize", type=int, default=5000)
+    parser.add_argument("--chunksize", type=int, default=4796)
     parser.add_argument("--overlap", type=int, default=500)
     parser.add_argument("--batchsize", type=int, default=64)
     args = parser.parse_args()

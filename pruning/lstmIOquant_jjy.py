@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np 
@@ -99,10 +100,11 @@ def hook_model(model, act_scales):
 
 @torch.no_grad()
 def main():
-    config_file = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/config.toml'
-    pretrained_model_file = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/weights_59.tar'
-    act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/layer_9_6x_act_scales.pth'
-    io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/layer_9_6x_io_quant.pth'
+    config_file = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/config.toml'
+    pretrained_model_file = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/weights_19.tar'
+    act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/layer_9_6x_act_scales.pth'
+    io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/layer_9_6x_io_quant.pth'
+    new_io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/layer_9_6x_io_quant_wo0.pth'
 
     # 构建模型
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -116,7 +118,7 @@ def main():
     # 构建数据集
     print("[loading data]")
     batch_size = 32
-    data_dir = '/workspace/huada/all_refs_label_for_ctc/train_data/train'
+    data_dir = '/workspace/huada/moffett_data/250F600274011_train_data/train'
     dataset = TrainingDataSet3(data_dir, tokenization="kmer")
     # 校准只需少量数据，取前2000条
     if len(dataset) > 20000:
@@ -143,6 +145,17 @@ def main():
     
     torch.save(act_scales,act_scales_path)
     torch.save(model.state_dict(), io_quant_path)
+
+
+    state_dict = torch.load(io_quant_path, map_location=device)
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        # encoder.X.0.rnn.* -> encoder.X.rnn.*
+        new_key = re.sub(r'(encoder\.\d+)\.0\.(rnn\.)', r'\1.\2', k)
+        new_state_dict[new_key] = v
+    torch.save(new_state_dict, new_io_quant_path)
+
+    
 
 
     ## remove .0
