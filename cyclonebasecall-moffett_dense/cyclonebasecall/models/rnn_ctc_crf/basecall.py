@@ -42,7 +42,7 @@ def stitch_results(results, length, size, overlap, stride, reverse=False):
 
 def compute_scores(model, batch, beam_width=32, beam_cut=100.0, scale=1.0, offset=0.0, blank_score=2.0, reverse=False):
     """
-    Compute scores for model.
+    Compute scores for model using koi beam_search decoding.
     """
     with torch.no_grad():
         device = next(model.parameters()).device
@@ -70,6 +70,134 @@ def compute_scores(model, batch, beam_width=32, beam_cut=100.0, scale=1.0, offse
         }
 
 
+# ============================================================
+# Viterbi guided bidirectional decode
+# ============================================================
+
+def _manual_logsumexp(x, dim=-1, keepdim=False):
+    x_max = x.max(dim=dim, keepdim=True)[0]
+    x_shifted = x - x_max
+    result = x_max + torch.log2(torch.sum(torch.exp(x_shifted), dim=dim, keepdim=True))
+    if not keepdim:
+        result = result.squeeze(dim)
+    return result
+
+# Map viterbi path indices (0=blank,1=A,2=C,3=G,4=T) to ASCII codes
+_BASE_ASCII_MAP = torch.tensor([0, 65, 67, 71, 84], dtype=torch.int8)
+
+
+def compute_scores_viterbi(model, batch, use_bfloat16=True):
+    """
+    Compute scores using viterbi_guided_bidirectional_reshape decoding.
+    Returns dict compatible with beam_search format for stitch/fmt.
+
+    Per-position confidence is computed from the forward-backward posterior
+    along the Viterbi path:  confidence[t] = alpha[t,src] + Ms[t,dst,z] + beta[t+1,dst]
+    and mapped to Phred+33 quality scores in the qstring.
+    """
+    with torch.no_grad():
+        device = next(model.parameters()).device
+        dtype = torch.float16 if half_supported() else torch.float32
+        scores = model(batch.to(dtype).to(device))  # (T, N, C) with blank
+
+        seqdist = model.seqdist
+        n_base = seqdist.n_base
+        state_len = seqdist.state_len
+        n_states = n_base ** state_len
+        n_alphabet = len(seqdist.alphabet)
+        idx = seqdist.idx.to(device=device, dtype=torch.long)
+
+        # Cache idx_T on seqdist
+        if not hasattr(seqdist, '_idx_T') or seqdist._idx_T.device != device:
+            idx_T = idx.flatten().argsort().reshape(*idx.shape).to(device)
+            seqdist._idx_T = idx_T
+            seqdist._idx_T_targets = idx_T // n_alphabet
+        idx_T = seqdist._idx_T
+        idx_T_targets = seqdist._idx_T_targets
+
+        T, N, _ = scores.shape
+        vdtype = torch.bfloat16 if use_bfloat16 else torch.float32
+        Ms = scores.transpose(1, 2).to(vdtype).reshape(T, n_states, n_alphabet, N)
+        Ms_T = Ms.reshape(T, -1, N)[:, idx_T, :]
+        segment_size = 8
+
+        # Forward
+        alphas_all = torch.zeros(T + 1, n_states, N, device=device, dtype=vdtype)
+        alpha = alphas_all[0]
+        for t in range(T):
+            alpha = torch.logsumexp(alpha[idx, :] + Ms[t], dim=1)
+            if t % segment_size == 0:
+                alpha = alpha - alpha.min(dim=0, keepdim=True)[0]
+            alphas_all[t + 1] = alpha
+
+        # Backward
+        betas_all = torch.zeros(T + 1, n_states, N, device=device, dtype=vdtype)
+        beta = betas_all[T]
+        for t in range(T - 1, -1, -1):
+            beta = torch.logsumexp(Ms_T[t] + beta[idx_T_targets, :], dim=1)
+            if t % segment_size == 0:
+                beta = beta - beta.min(dim=0, keepdim=True)[0]
+            betas_all[t] = beta
+
+        # Guided Viterbi
+        alpha_max = torch.full((n_states, N), float('-inf'), device=device, dtype=vdtype)
+        alpha_max[0, :] = 0.0
+        traceback = torch.zeros(T, n_states, N, dtype=torch.int8, device=device)
+        for t in range(T):
+            guided = alphas_all[t][idx, :] + Ms[t] + betas_all[t + 1][:, None, :]
+            alpha_max, best_z = (alpha_max[idx, :] + guided).max(dim=1)
+            traceback[t] = best_z.to(torch.int8)
+            if t % segment_size == 0:
+                alpha_max = alpha_max - alpha_max.max(dim=0, keepdim=True)[0]
+
+        # Traceback with per-position confidence
+        current_states = alpha_max.argmax(dim=0)
+        paths = torch.zeros(T, N, dtype=torch.int8, device=device)
+        confidence = torch.zeros(T, N, device=device, dtype=torch.float32)
+        batch_idx = torch.arange(N, device=device)
+
+        for t in range(T - 1, -1, -1):
+            dst_state = current_states
+            best_edges = traceback[t, dst_state, batch_idx]
+            paths[t] = best_edges
+            src_state = idx[dst_state, best_edges.long()]
+
+            # Per-position forward-backward posterior along the Viterbi path:
+            #   confidence = alpha(t, src) + Ms(t, dst, edge) + beta(t+1, dst)
+            confidence[t] = (
+                alphas_all[t][src_state, batch_idx]
+                + Ms[t][dst_state, best_edges.long(), batch_idx]
+                + betas_all[t + 1][dst_state, batch_idx]
+            ).float()
+
+            current_states = src_state
+
+        # paths: (T, N), values 0-4 (0=blank, 1-4=ACGT)
+        # Convert to (N, T) beam_search-compatible format
+        paths = paths.T            # (N, T)
+        confidence = confidence.T  # (N, T)
+
+        ascii_map = _BASE_ASCII_MAP.to(device)
+        sequence = ascii_map[paths.long()]            # (N, T) ASCII codes
+        moves = (paths != 0).to(torch.int8)           # (N, T)
+
+        # Convert confidence to Phred+33 quality scores
+        # Normalize per sample: map [min, max] -> [0, 1] -> ASCII [33, 93]
+        # ASCII 33 ('!') = Q0 (lowest), ASCII 93 (']') = Q60 (highest)
+        c_min = confidence.min(dim=1, keepdim=True)[0]
+        c_max = confidence.max(dim=1, keepdim=True)[0]
+        c_range = (c_max - c_min).clamp(min=1e-6)
+        c_norm = (confidence - c_min) / c_range       # [0, 1] per sample
+        qscores = (33 + c_norm * 60).to(torch.int8)   # ASCII 33~93
+        qstring = moves * qscores                      # 0 where blank
+
+        return {
+            'moves': moves.cpu(),
+            'qstring': qstring.cpu(),
+            'sequence': sequence.cpu(),
+        }
+
+
 def fmt(stride, attrs):
     return {
         'stride': stride,
@@ -79,7 +207,8 @@ def fmt(stride, attrs):
     }
 
 
-def basecall(model, reads, chunksize=4000, overlap=100, batchsize=32, model_stride=5, reverse=False, scale=1.0, offset=0.0):
+def basecall(model, reads, chunksize=4000, overlap=100, batchsize=32, model_stride=5,
+             reverse=False, scale=1.0, offset=0.0, decode_method='beam_search'):
     """
     Basecalls a set of reads.
     """
@@ -90,9 +219,14 @@ def basecall(model, reads, chunksize=4000, overlap=100, batchsize=32, model_stri
 
     batches = thread_iter(batchify(chunks, batchsize=batchsize))
 
-    scores = thread_iter(
-        (read, compute_scores(model, batch, reverse=reverse, scale=scale, offset=offset)) for read, batch in batches
-    )
+    if decode_method == 'viterbi':
+        scores = thread_iter(
+            (read, compute_scores_viterbi(model, batch)) for read, batch in batches
+        )
+    else:
+        scores = thread_iter(
+            (read, compute_scores(model, batch, reverse=reverse, scale=scale, offset=offset)) for read, batch in batches
+        )
 
     results = thread_iter(
         (read, stitch_results(scores, end - start, chunksize, overlap, model_stride, reverse))
