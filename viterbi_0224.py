@@ -1,13 +1,25 @@
 """
-Self-contained Viterbi evaluation script.
+Self-contained Viterbi / Beam Search evaluation script.
 
-Usage:
-    python /workspace/huada/scall/viterbi_0211.py \
+Usage (viterbi, default):
+    python /workspace/huada/scall/viterbi_0224.py \
     --model_dir /workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214 \
     --data_dir /workspace/huada/moffett_data/250F600274011_train_data/val \
     --device cuda:0 \
     --val_batch_size 64 \
     --seed 25
+
+Usage (beam search with koi):
+    python /workspace/huada/scall/viterbi_0224.py \
+    --model_dir /workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214 \
+    --data_dir /workspace/huada/moffett_data/250F600274011_train_data/val \
+    --device cuda:0 \
+    --val_batch_size 64 \
+    --seed 25 \
+    --use_koi \
+    --beam_width 32 \
+    --beam_cut 100.0 \
+    --blank_score 2.0
 """
 
 import os
@@ -29,6 +41,13 @@ import parasail
 
 pro_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, pro_dir)
+
+# Optional koi beam search support
+try:
+    from koi.decode import beam_search as koi_beam_search, to_str
+    KOI_AVAILABLE = True
+except ImportError:
+    KOI_AVAILABLE = False
 
 
 # ============================================================
@@ -90,8 +109,8 @@ def manual_logsumexp(x, dim=-1, keepdim=False):
     # 步骤2: 减去最大值
     x_shifted = x - x_max
     
-    # 步骤3: exp -> sum -> log
-    result = x_max + torch.log2(torch.sum(torch.exp(x_shifted), dim=dim, keepdim=True))
+    # 步骤3: exp -> sum -> log (自然对数，与torch.logsumexp一致)
+    result = x_max + torch.log(torch.sum(torch.exp(x_shifted), dim=dim, keepdim=True))
     
     # 步骤4: 处理 keepdim
     if not keepdim:
@@ -194,12 +213,20 @@ class FakeQuant(torch.nn.Module):
 
 
 def insert_fakequant_backbone(model, act_scales, bitwidth, device):
-    """Insert FakeQuant after LSTM layers in backbone (skip the last LSTM)."""
-    num_layers = len(model.backbone._modules)
+    """Insert FakeQuant around LSTM layers in backbone, ensuring all inputs/outputs are quantized."""
+    first_lstm = True
     for i, (name, module) in enumerate(model.backbone._modules.items()):
         if isinstance(module, LSTM):
-            if i != num_layers - 1:  # skip last LSTM
-                scale_key = f'encoder.{name}'
+            scale_key = f'encoder.{name}'
+            if first_lstm:
+                # 第一个LSTM的输入来自Conv，需要额外加input quant
+                model.backbone._modules[name] = torch.nn.Sequential(
+                    FakeQuant(bitwidth, act_scales[scale_key]["input"].to(device)),
+                    module,
+                    FakeQuant(bitwidth, act_scales[scale_key]["output"].to(device))
+                )
+                first_lstm = False
+            else:
                 model.backbone._modules[name] = torch.nn.Sequential(
                     module,
                     FakeQuant(bitwidth, act_scales[scale_key]["output"].to(device))
@@ -295,12 +322,13 @@ class CTC_CRF:
             .reshape(self.n_base, -1).T,
         ], dim=1).to(torch.int32)
 
-    def viterbi_guided_bidirectional_reshape(self, scores, use_bfloat16=True):
+    def viterbi_guided_bidirectional_reshape(self, scores, use_bfloat16=True, beam_width=32):
         T, N, _ = scores.shape
         n_states = self.n_base ** self.state_len
         n_alphabet = len(self.alphabet)
         device = scores.device
         idx = self.idx.to(device=device, dtype=torch.long)
+        K = beam_width
 
         if not hasattr(self, '_idx_T') or self._idx_T.device != device:
             idx_T = idx.flatten().argsort().reshape(*idx.shape).to(device)
@@ -318,27 +346,31 @@ class CTC_CRF:
         alphas_all = torch.zeros(T + 1, n_states, N, device=device, dtype=dtype)
         alpha = alphas_all[0]
         for t in range(T):
-            alpha = manual_logsumexp(alpha[idx, :] + Ms[t], dim=1)
+            alpha = torch.logsumexp(alpha[idx, :] + Ms[t], dim=1)
             if t % segment_size == 0:
-                alpha = alpha - alpha.min(dim=0, keepdim=True)[0]
+                alpha = alpha - alpha.max(dim=0, keepdim=True)[0]
             alphas_all[t + 1] = alpha
 
         # Backward
         betas_all = torch.zeros(T + 1, n_states, N, device=device, dtype=dtype)
         beta = betas_all[T]
         for t in range(T - 1, -1, -1):
-            beta = manual_logsumexp(Ms_T[t] + beta[idx_T_targets, :], dim=1)
+            beta = torch.logsumexp(Ms_T[t] + beta[idx_T_targets, :], dim=1)
             if t % segment_size == 0:
-                beta = beta - beta.min(dim=0, keepdim=True)[0]
+                beta = beta - beta.max(dim=0, keepdim=True)[0]
             betas_all[t] = beta
 
-        # Guided Viterbi
+        # Posterior-normalized Viterbi
         alpha_max = torch.full((n_states, N), float('-inf'), device=device, dtype=dtype)
         alpha_max[0, :] = 0.0
         traceback = torch.zeros(T, n_states, N, dtype=torch.int8, device=device)
         for t in range(T):
-            guided = alphas_all[t][idx, :] + Ms[t] + betas_all[t + 1][:, None, :]
-            alpha_max, best_z = (alpha_max[idx, :] + guided).max(dim=1)
+            edge_post = alphas_all[t][idx, :] + Ms[t] + betas_all[t + 1][:, None, :]
+            # 减 max 归一化（轻量数值稳定化）
+            flat = edge_post.reshape(-1, N)
+            log_post = (flat - flat.max(dim=0, keepdim=True)[0]).reshape(n_states, n_alphabet, N)
+            # Viterbi step
+            alpha_max, best_z = (alpha_max[idx, :] + log_post).max(dim=1)
             traceback[t] = best_z.to(torch.int8)
             if t % segment_size == 0:
                 alpha_max = alpha_max - alpha_max.max(dim=0, keepdim=True)[0]
@@ -409,13 +441,71 @@ class Model(Module):
         x = self.crfencoder(x)
         return x
 
-    def decode_batch(self, scores, use_bfloat16=True):
+    def decode_batch(self, scores, use_koi=False, beam_width=32, beam_cut=100.0,
+                     scale=1.0, offset=0.0, blank_score=2.0, use_bfloat16=True):
+        """
+        Decode a batch of scores using either koi beam_search or viterbi decoding.
+
+        Args:
+            scores: scores tensor of shape (T, N, C)
+            use_koi: whether to use koi beam_search (if available)
+            beam_width: beam width for beam search
+            beam_cut: beam cut threshold for beam search
+            scale: scale factor for beam search
+            offset: offset for beam search
+            blank_score: blank score for beam search
+            use_bfloat16: use bfloat16 for viterbi computation
+
+        Returns:
+            list of decoded sequences (strings)
+        """
         with torch.no_grad():
-            dtype = torch.bfloat16 if use_bfloat16 else torch.float32
-            paths = self.seqdist.viterbi_guided_bidirectional_reshape(
-                scores.to(dtype), use_bfloat16=use_bfloat16
-            )
-        return [self.seqdist.path_to_str(path) for path in paths.cpu().numpy()]
+            if use_koi and KOI_AVAILABLE:
+                # ---- koi beam_search path ----
+                # Permute from (T, N, C) to (N, T, C)
+                T, N, C = scores.shape
+                bs_scores = scores.permute(1, 0, 2).contiguous()
+
+                # Reshape to remove blank:
+                # C = n_states * n_alphabet, where n_alphabet = n_base + 1 (including blank)
+                n_states = self.seqdist.n_base ** self.seqdist.state_len
+                n_alphabet = len(self.seqdist.alphabet)  # n_base + 1
+
+                # (N, T, C) -> (N, T, n_states, n_alphabet)
+                bs_scores = bs_scores.reshape(N, T, n_states, n_alphabet)
+                # Remove blank (first element): keep [:, :, :, 1:]
+                bs_scores = bs_scores[:, :, :, 1:]
+                # Reshape back: (N, T, n_states * n_base)
+                bs_scores = bs_scores.reshape(N, T, -1).contiguous()
+
+                # Convert to fp16 (required by koi)
+                if bs_scores.dtype != torch.float16:
+                    bs_scores = bs_scores.to(torch.float16)
+
+                # Call koi beam_search
+                sequence, qstring, moves = koi_beam_search(
+                    bs_scores,
+                    beam_width=beam_width,
+                    beam_cut=beam_cut,
+                    scale=scale,
+                    offset=offset,
+                    blank_score=blank_score,
+                )
+
+                # Convert each sequence to string
+                results = []
+                for i in range(N):
+                    seq_str = to_str(sequence[i])
+                    results.append(seq_str)
+                return results
+
+            else:
+                # ---- Viterbi decoding path ----
+                dtype = torch.bfloat16 if use_bfloat16 else torch.float32
+                paths = self.seqdist.viterbi_guided_bidirectional_reshape(
+                    scores.to(dtype), use_bfloat16=use_bfloat16
+                )
+                return [self.seqdist.path_to_str(path) for path in paths.cpu().numpy()]
 
 
 # ============================================================
@@ -547,10 +637,13 @@ class TrainingDataSet3(Dataset):
 # Evaluation
 # ============================================================
 
-def model_eval(dataloader, model, is_half, device):
+def model_eval(dataloader, model, is_half, device, use_koi=False,
+               beam_width=32, beam_cut=100.0, scale=1.0, offset=0.0, blank_score=2.0):
     targets, seqs = [], []
     t0 = time.perf_counter()
     total_samples = 0
+    decode_mode = "beam_search (koi)" if (use_koi and KOI_AVAILABLE) else "viterbi"
+    print(f"[Decode mode: {decode_mode}]")
     accuracy_with_cov = lambda ref, seq: accuracy(ref, seq, min_coverage=0.95)
 
     with torch.no_grad():
@@ -559,10 +652,14 @@ def model_eval(dataloader, model, is_half, device):
             data = data.type(torch.float16).to(device) if is_half else data.to(device)
             total_samples += data.shape[0] * data.shape[2]
 
-            # backbone (CNN + LSTM) → crfencoder (LinearCRFEncoder) → viterbi decode
-            x = model.backbone(data)  # 墨芯卡
+            # backbone (CNN + LSTM) → crfencoder (LinearCRFEncoder) → decode
+            x = model.backbone(data)
             scores = model.crfencoder(x)
-            seqs.extend(model.decode_batch(scores))
+            seqs.extend(model.decode_batch(
+                scores, use_koi=use_koi, beam_width=beam_width,
+                beam_cut=beam_cut, scale=scale, offset=offset,
+                blank_score=blank_score,
+            ))
 
     duration = time.perf_counter() - t0
     refs = [decode_ref(t, model.alphabet) for t in targets]
@@ -587,7 +684,7 @@ def model_eval(dataloader, model, is_half, device):
 # ============================================================
 
 def get_parser():
-    parser = argparse.ArgumentParser(description='Viterbi Evaluation Script')
+    parser = argparse.ArgumentParser(description='Viterbi / Beam Search Evaluation Script')
     parser.add_argument("--model_dir", type=str, required=True,
                         help="Directory containing config.toml, io_quant.pth, act_scales.pth")
     parser.add_argument("--data_dir", type=str, required=True,
@@ -596,6 +693,20 @@ def get_parser():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--use_half", action="store_true", default=True)
     parser.add_argument("--seed", type=int, default=25)
+
+    # Beam search arguments
+    parser.add_argument("--use_koi", action="store_true", default=False,
+                        help="Use koi beam_search for decoding (requires koi package)")
+    parser.add_argument("--beam_width", type=int, default=32,
+                        help="Beam width for beam search (default: 32)")
+    parser.add_argument("--beam_cut", type=float, default=100.0,
+                        help="Beam cut threshold for beam search (default: 100.0)")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="Scale factor for beam search (default: 1.0)")
+    parser.add_argument("--offset", type=float, default=0.0,
+                        help="Offset for beam search (default: 0.0)")
+    parser.add_argument("--blank_score", type=float, default=2.0,
+                        help="Blank score for beam search (default: 2.0)")
     return parser
 
 
@@ -641,14 +752,30 @@ def main():
                               shuffle=False, num_workers=0, pin_memory=True)
     print(f"Validation: {len(test_dataset)} samples, {len(valid_loader)} batches")
 
+    # Check koi availability if requested
+    if args.use_koi and not KOI_AVAILABLE:
+        print("[WARNING] --use_koi specified but koi is not installed. Falling back to viterbi.")
+
     print("=" * 60)
     print(f"Model: {MODEL_DIR}")
     print(f"Weights: {IO_QUANT_PATH}")
     print(f"Act scales: {ACT_SCALES_PATH}")
     print(f"Device: {args.device}, Half: {args.use_half}")
+    print(f"Decode: {'beam_search (koi)' if (args.use_koi and KOI_AVAILABLE) else 'viterbi'}")
+    if args.use_koi and KOI_AVAILABLE:
+        print(f"  beam_width={args.beam_width}, beam_cut={args.beam_cut}, "
+              f"scale={args.scale}, offset={args.offset}, blank_score={args.blank_score}")
     print("=" * 60)
 
-    res = model_eval(valid_loader, model, args.use_half, args.device)
+    res = model_eval(
+        valid_loader, model, args.use_half, args.device,
+        use_koi=args.use_koi,
+        beam_width=args.beam_width,
+        beam_cut=args.beam_cut,
+        scale=args.scale,
+        offset=args.offset,
+        blank_score=args.blank_score,
+    )
 
     print(f"\n{'='*60}")
     print(f"Mean: {res[0]:.2f}%  Median: {res[1]:.2f}%  Time: {res[2]:.2f}s")
