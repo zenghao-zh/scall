@@ -7,7 +7,7 @@ from datetime import timedelta
 from cyclonebasecall.bonito.reader import Reader
 from cyclonebasecall.bonito.io import Hybrid_Writer, Writer, biofmt
 from cyclonebasecall.bonito.multiprocessing import process_cancel
-from cyclonebasecall.bonito.util import column_to_set, load_symbol, load_model, init
+from cyclonebasecall.bonito.util import column_to_set, load_symbol, load_model, load_quant_model, init
 from cyclonebasecall.util import get_bgi_reads
 from cyclonebasecall.conf import PROJ_DIR, DOWNLOAD_URL
 from cyclonebasecall.util import DownloadZipFile
@@ -41,15 +41,28 @@ def one_fast5_basecall(params):
     init(seed=25, device=params["device"])
     fmt = biofmt()
 
-    model = load_model(
-        params["model_directory"],
-        device=params["device"],
-        chunksize=params["chunksize"],
-        overlap=params["overlap"],
-        batchsize=params["batchsize"],
-        quantize=None,
-        use_koi=True,
-    )
+    # Use quantized model loading if io_quant_path and act_scales_path are provided
+    io_quant_path = params.get("io_quant_path")
+    act_scales_path = params.get("act_scales_path")
+    if io_quant_path and act_scales_path:
+        sys.stderr.write("> loading quantized model (FakeQuant)\n")
+        model = load_quant_model(
+            params["model_directory"],
+            device=params["device"],
+            io_quant_path=io_quant_path,
+            act_scales_path=act_scales_path,
+            bf16 = True
+        )
+    else:
+        model = load_model(
+            params["model_directory"],
+            device=params["device"],
+            chunksize=params["chunksize"],
+            overlap=params["overlap"],
+            batchsize=params["batchsize"],
+            quantize=None,
+            use_koi=True,
+        )
     basecall = load_symbol(params["model_directory"], "basecall")
 
     groups = []
@@ -81,7 +94,8 @@ def one_fast5_basecall(params):
         overlap=params["overlap"],
         scale=params["scale"],
         offset=params["offset"],
-        model_stride=params["stride"]
+        model_stride=params["stride"],
+        decode_method=params.get("decode_method", "beam_search"),
     )
     writer = Writer(
         fmt.mode,

@@ -55,18 +55,23 @@ class FakeQuant(torch.nn.Module):
         return x
 
 
-# 在模型中的LSTM层后面插入fake quantization层
-def insert_fakequant(model, act_scales, bitwidth,device):
+# 在模型中的所有LSTM层插入fake quantization层，确保每层输入输出都被量化
+def insert_fakequant(model, act_scales, bitwidth, device):
     num_layers = len(model._modules['encoder']._modules)
     print(f"num_layers: {num_layers}")
+    # 找出所有LSTM层的索引
+    lstm_entries = [
+        (i, name, module) for i, (name, module)
+        in enumerate(model._modules['encoder']._modules.items())
+        if isinstance(module, LSTM)
+    ]
     for i, (name, module) in enumerate(model._modules['encoder']._modules.items()):
-        # replace all linear layers in the model
         if isinstance(module, LSTM):
-            if i != num_layers - 2:
-                model._modules['encoder']._modules[name] = torch.nn.Sequential(
-                    module,
-                    FakeQuant(bitwidth, act_scales['encoder.'+ name]["output"].to(device))
-                )
+            scale_key = 'encoder.' + name
+            model._modules['encoder']._modules[name] = torch.nn.Sequential(
+                module,
+                FakeQuant(bitwidth, act_scales[scale_key]["output"].to(device))
+            )
     return model
 
 
@@ -100,11 +105,19 @@ def hook_model(model, act_scales):
 
 @torch.no_grad()
 def main():
-    config_file = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/config.toml'
-    pretrained_model_file = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/weights_19.tar'
-    act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/layer_9_6x_act_scales.pth'
-    io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/layer_9_6x_io_quant.pth'
-    new_io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/layer_9_6x_io_quant_wo0.pth'
+    config_file = '/workspace/huada/task_results/lstm_ctc_crf_qat_int8/config.toml'
+    pretrained_model_file = '/workspace/huada/task_results/lstm_ctc_crf_qat_int8/weights_8.tar'
+    act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_qat_int8/act_scales_8.pth'
+    io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_qat_int8/io_quant_8.pth'
+    new_io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_qat_int8/io_quant_wo0_8.pth'
+
+    # config_file = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/config.toml'
+    # pretrained_model_file = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/weights_40.tar'
+    # act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/layer_9_6x_act_scales_40.
+    # pth'
+    # io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/layer_9_6x_io_quant_40.pth'
+    # new_io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/
+    # layer_9_6x_io_quant_wo0_40.pth'
 
     # 构建模型
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -122,7 +135,8 @@ def main():
     dataset = TrainingDataSet3(data_dir, tokenization="kmer")
     # 校准只需少量数据，取前2000条
     if len(dataset) > 20000:
-        dataset = torch.utils.data.Subset(dataset, range(20000))
+        indices = torch.randperm(len(dataset))[:20000].tolist()
+        dataset = torch.utils.data.Subset(dataset, indices)
     val_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=4, pin_memory=True, shuffle=False)
 
     act_scales = dict()
@@ -150,8 +164,8 @@ def main():
     state_dict = torch.load(io_quant_path, map_location=device)
     new_state_dict = {}
     for k, v in state_dict.items():
-        # encoder.X.0.rnn.* -> encoder.X.rnn.*
-        new_key = re.sub(r'(encoder\.\d+)\.0\.(rnn\.)', r'\1.\2', k)
+        # encoder.X.{0或1}.rnn.* -> encoder.X.rnn.*（第一个LSTM的rnn在索引1，其余在索引0）
+        new_key = re.sub(r'(encoder\.\d+)\.\d+\.(rnn\.)', r'\1.\2', k)
         new_state_dict[new_key] = v
     torch.save(new_state_dict, new_io_quant_path)
 

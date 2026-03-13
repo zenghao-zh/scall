@@ -300,14 +300,6 @@ def _load_model(model_file, config, device, half=None, use_koi=False):
     Model = load_symbol(config, "Model")
     model = Model(config)
 
-    # if config["model"]["package"] == ".models.rnn_ctc_crf" and use_koi:
-    #     model.encoder = koi.lstm.update_graph(
-    #         model.encoder,
-    #         batchsize=config["basecaller"]["batchsize"],
-    #         chunksize=config["basecaller"]["chunksize"] // model.stride,
-    #         quantize=config["basecaller"]["quantize"],
-    #     )
-
     state_dict = torch.load(model_file, map_location=device)
     state_dict = {k2: state_dict[k1] for k1, k2 in match_names(state_dict, model).items()}
 
@@ -320,6 +312,70 @@ def _load_model(model_file, config, device, half=None, use_koi=False):
         model = model.half()
     model.eval()
     model.to(device)
+    return model
+
+
+# ============================================================
+# Quantized model loading (FakeQuant)
+# ============================================================
+
+class FakeQuant(torch.nn.Module):
+    """Fake quantization layer for simulating int8 quantization effects."""
+    def __init__(self, num_bits, max_val):
+        super(FakeQuant, self).__init__()
+        self.scale = max_val / (2**(num_bits - 1) - 1)
+        self.num_bits = num_bits
+
+    def forward(self, x, return_features=False):
+        scale = self.scale.to(dtype=x.dtype, device=x.device)
+        x = torch.clamp(x / scale, -2**(self.num_bits - 1), 2**(self.num_bits - 1) - 1)
+        x = torch.round(x)
+        x = x * scale
+        return x
+
+
+def _insert_fakequant_encoder(model, act_scales, bitwidth, device):
+    """Insert FakeQuant after all LSTM layers in model.encoder."""
+    from cyclonebasecall.models.common.nn import LSTM
+    encoder_modules = model.encoder._modules
+    for i, (name, module) in enumerate(encoder_modules.items()):
+        if isinstance(module, LSTM):
+            scale_key = f'encoder.{name}'
+            encoder_modules[name] = torch.nn.Sequential(
+                module,
+                FakeQuant(bitwidth, act_scales[scale_key]["output"].to(device))
+            )
+    print(model)
+    return model
+
+
+def load_quant_model(dirname, device, io_quant_path, act_scales_path, half=None, bitwidth=8):
+    """
+    Load a model with FakeQuant layers inserted, using quantized weights.
+    """
+    if not os.path.isdir(dirname) and os.path.isdir(os.path.join(__models__, dirname)):
+        dirname = os.path.join(__models__, dirname)
+
+    device_obj = torch.device(device)
+    config = toml.load(os.path.join(dirname, 'config.toml'))
+    Model = load_symbol(config, "Model")
+    model = Model(config)
+
+    # Insert FakeQuant layers
+    act_scales = torch.load(act_scales_path, map_location=device_obj)
+    _insert_fakequant_encoder(model, act_scales, bitwidth, device_obj)
+
+    # Load quantized weights
+    state_dict = torch.load(io_quant_path, map_location=device_obj)
+    state_dict = {k2: state_dict[k1] for k1, k2 in match_names(state_dict, model).items()}
+    model.load_state_dict(state_dict)
+
+    if half is None:
+        half = half_supported()
+    if half:
+        model = model.half()
+    model.eval()
+    model.to(device_obj)
     return model
 
 

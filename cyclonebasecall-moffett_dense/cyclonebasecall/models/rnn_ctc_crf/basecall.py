@@ -127,7 +127,7 @@ def compute_scores_viterbi(model, batch, use_bfloat16=True):
         for t in range(T):
             alpha = torch.logsumexp(alpha[idx, :] + Ms[t], dim=1)
             if t % segment_size == 0:
-                alpha = alpha - alpha.min(dim=0, keepdim=True)[0]
+                alpha = alpha - alpha.max(dim=0, keepdim=True)[0]
             alphas_all[t + 1] = alpha
 
         # Backward
@@ -136,16 +136,26 @@ def compute_scores_viterbi(model, batch, use_bfloat16=True):
         for t in range(T - 1, -1, -1):
             beta = torch.logsumexp(Ms_T[t] + beta[idx_T_targets, :], dim=1)
             if t % segment_size == 0:
-                beta = beta - beta.min(dim=0, keepdim=True)[0]
+                beta = beta - beta.max(dim=0, keepdim=True)[0]
             betas_all[t] = beta
 
-        # Guided Viterbi
+        # Posterior-normalized Viterbi
+        # The key missing step: compute proper posterior probabilities via softmax
+        # before running Viterbi. This matches the standard pipeline:
+        #   posteriors = softmax(alpha_fwd[t,src] + Ms[t] + beta[t+1,dst])
+        #   viterbi on log(posteriors)
         alpha_max = torch.full((n_states, N), float('-inf'), device=device, dtype=vdtype)
         alpha_max[0, :] = 0.0
         traceback = torch.zeros(T, n_states, N, dtype=torch.int8, device=device)
         for t in range(T):
-            guided = alphas_all[t][idx, :] + Ms[t] + betas_all[t + 1][:, None, :]
-            alpha_max, best_z = (alpha_max[idx, :] + guided).max(dim=1)
+            # Edge posterior in log space: alpha(t, src) + Ms(t, dst, z) + beta(t+1, dst)
+            edge_post = alphas_all[t][idx, :] + Ms[t] + betas_all[t + 1][:, None, :]
+            # Softmax normalize across all edges per batch element (Log.dsum = softmax)
+            # Use float32 for numerical stability, then convert back
+            flat = edge_post.reshape(-1, N)
+            log_post = (flat - flat.max(dim=0, keepdim=True)[0]).reshape(n_states, n_alphabet, N)
+            # Standard Viterbi step on normalized log-posterior scores
+            alpha_max, best_z = (alpha_max[idx, :] + log_post).max(dim=1)
             traceback[t] = best_z.to(torch.int8)
             if t % segment_size == 0:
                 alpha_max = alpha_max - alpha_max.max(dim=0, keepdim=True)[0]

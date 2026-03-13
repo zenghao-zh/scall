@@ -3,6 +3,7 @@ opencall CTC-CRF Model.
 """
 
 from numpy.core.arrayprint import dtype_is_implied
+from numpy.ma.core import true_divide
 import torch
 import numpy as np
 from opencall.models.common.nn import (
@@ -485,7 +486,7 @@ class CTC_CRF(SequenceDist):
         
         # 归一化间隔（bfloat16 需要更频繁的归一化）
         # 更小的 segment_size = 更频繁的归一化 = 更好的数值稳定性
-        segment_size = 10
+        segment_size = 8
         
         # ========================================
         # 步骤1: Log Forward (manual_logsumexp + 归一化)
@@ -543,7 +544,7 @@ class CTC_CRF(SequenceDist):
             alpha_max, best_z = candidates.max(dim=1)  # 用 float 保证精度
             traceback[t] = best_z.to(torch.int8)
 
-            if t % 5 == 0:
+            if t % segment_size == 0:
                 alpha_max = alpha_max-alpha_max.max(dim=0, keepdim=True)[0]
 
         # ========================================

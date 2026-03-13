@@ -22,16 +22,23 @@ class FakeQuant(torch.nn.Module):
 
 
 def insert_fakequant(model, act_scales, bitwidth, device):
-    """用 act_scales 重建 FakeQuant 结构，使 state_dict key 与 io_quant.pth 对齐"""
     num_layers = len(model._modules['encoder']._modules)
+    print(f"num_layers: {num_layers}")
+    # 找出所有LSTM层的索引
+    lstm_entries = [
+        (i, name, module) for i, (name, module)
+        in enumerate(model._modules['encoder']._modules.items())
+        if isinstance(module, LSTM)
+    ]
     for i, (name, module) in enumerate(model._modules['encoder']._modules.items()):
         if isinstance(module, LSTM):
-            if i != num_layers - 2:
-                model._modules['encoder']._modules[name] = torch.nn.Sequential(
-                    module,
-                    FakeQuant(bitwidth, act_scales['encoder.' + name]["output"].to(device))
-                )
+            scale_key = 'encoder.' + name
+            model._modules['encoder']._modules[name] = torch.nn.Sequential(
+                module,
+                FakeQuant(bitwidth, act_scales[scale_key]["output"].to(device))
+            )
     return model
+
 
 
 def load_io_quant_model(config_file, io_quant_path, act_scales_path, device="cpu"):
@@ -57,12 +64,12 @@ def load_io_quant_model(config_file, io_quant_path, act_scales_path, device="cpu
     model.load_state_dict(state_dict)
 
 
-    # new_state_dict = {}
-    # for k, v in state_dict.items():
-    #     # encoder.X.0.rnn.* -> encoder.X.rnn.*
-    #     new_key = re.sub(r'(encoder\.\d+)\.0\.(rnn\.)', r'\1.\2', k)
-    #     new_state_dict[new_key] = v
-    # state_dict = new_state_dict
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        # encoder.X.{0或1}.rnn.* -> encoder.X.rnn.*（第一个LSTM的rnn在索引1，其余在索引0）
+        new_key = re.sub(r'(encoder\.\d+)\.\d+\.(rnn\.)', r'\1.\2', k)
+        new_state_dict[new_key] = v
+    state_dict = new_state_dict
 
     model.eval()
 
@@ -70,9 +77,9 @@ def load_io_quant_model(config_file, io_quant_path, act_scales_path, device="cpu
 
 
 if __name__ == "__main__":
-    config_file = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/config.toml'
-    io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/layer_9_6x_io_quant.pth'
-    act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_kmer_0123_67/layer_9_6x_act_scales.pth'
+    config_file = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/config.toml'
+    io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/layer_9_6x_io_quant_40.pth'
+    act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/layer_9_6x_act_scales_40.pth'
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     model, act_scales = load_io_quant_model(config_file, io_quant_path, act_scales_path, device)

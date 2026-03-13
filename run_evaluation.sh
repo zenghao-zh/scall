@@ -28,3 +28,5 @@ python /workspace/huada/scall/opencall_cli/evaluate.py \
 
 echo "Evaluation completed!"
 
+
+

@@ -164,6 +164,86 @@ class LSTM(RNNWrapper):
     def __init__(self, size, insize, bias=True, reverse=False, dropout=0.0):
         super().__init__(torch.nn.LSTM, size, insize, bias=bias, reverse=reverse, dropout=dropout)
 
+
+class ManualLSTMRNN(Module):
+    """Drop-in replacement for torch.nn.LSTM (single-layer, unidirectional).
+
+    Uses torch.mm / sigmoid / tanh which natively support bfloat16 on CUDA,
+    bypassing the _thnn_fused_lstm_cell kernel that does not support bf16.
+    Parameter names match torch.nn.LSTM so state_dict loads directly.
+    """
+
+    def __init__(self, input_size, hidden_size, bias=True, **kwargs):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.bias = bias
+        self.weight_ih_l0 = torch.nn.Parameter(torch.empty(4 * hidden_size, input_size))
+        self.weight_hh_l0 = torch.nn.Parameter(torch.empty(4 * hidden_size, hidden_size))
+        if bias:
+            self.bias_ih_l0 = torch.nn.Parameter(torch.empty(4 * hidden_size))
+            self.bias_hh_l0 = torch.nn.Parameter(torch.empty(4 * hidden_size))
+        else:
+            self.register_parameter('bias_ih_l0', None)
+            self.register_parameter('bias_hh_l0', None)
+
+    @staticmethod
+    def _fake_quant_weight(w, num_bits=8):
+        """Per-tensor symmetric fake quantization for weight: quantize then dequantize."""
+        max_val = w.detach().abs().max()
+        qmax = 2 ** (num_bits - 1) - 1
+        scale = max_val / qmax
+        if scale == 0:
+            return w
+        w_q = torch.clamp(w / scale, -qmax, qmax)
+        w_q = torch.round(w_q)
+        return w_q * scale
+
+    def forward(self, x, hx=None):
+        T, N, _ = x.shape
+        H = self.hidden_size
+        if hx is not None:
+            h, c = hx[0].squeeze(0), hx[1].squeeze(0)
+        else:
+            h = torch.zeros(N, H, dtype=x.dtype, device=x.device)
+            c = torch.zeros(N, H, dtype=x.dtype, device=x.device)
+
+        ### weight 量化
+        W_ih = self.weight_ih_l0
+        W_hh = self.weight_hh_l0
+        
+        b = (self.bias_ih_l0 + self.bias_hh_l0) if self.bias else None
+        outputs = []
+        for t in range(T):
+            gates = torch.mm(x[t], W_ih.t()) + torch.mm(h, W_hh.t())
+            if b is not None:
+                gates = gates + b
+            i, f, g, o = gates.chunk(4, dim=1)
+            i, f, g, o = torch.sigmoid(i), torch.sigmoid(f), torch.tanh(g), torch.sigmoid(o)
+            c = f * c + i * g
+            h = o * torch.tanh(c)
+            outputs.append(h)
+        return torch.stack(outputs, dim=0), (h.unsqueeze(0), c.unsqueeze(0))
+
+
+def replace_lstm_with_manual(model):
+    """Replace all torch.nn.LSTM inside LSTM (RNNWrapper) with ManualLSTMRNN.
+
+    Copies weights so the model produces identical results.
+    Must be called *before* converting to bfloat16.
+    """
+    replaced = 0
+    for _name, module in model.named_modules():
+        if isinstance(module, LSTM) and isinstance(module.rnn, torch.nn.LSTM):
+            old = module.rnn
+            manual = ManualLSTMRNN(old.input_size, old.hidden_size, bias=old.bias)
+            manual.load_state_dict(old.state_dict())
+            module.rnn = manual
+            replaced += 1
+    print(f"[replace_lstm_with_manual] Replaced {replaced} torch.nn.LSTM → ManualLSTMRNN")
+    return model
+
+
 @register
 class LinearCRFEncoder(Module):
     def __init__(self, insize, n_base, state_len, bias=True, scale=None,
@@ -210,6 +290,38 @@ class FakeQuant(torch.nn.Module):
         x = torch.round(x)
         x = x * scale
         return x
+# class FakeQuant(torch.nn.Module):
+#     # def __init__(self, num_bits, max_val):
+#     #     super(FakeQuant, self).__init__()
+#     #     self.scale = max_val / (2**(num_bits - 1) - 1)
+#     #     self.num_bits = num_bits
+
+#     # def forward(self, x):
+#     #     class FakeQuant(torch.nn.Module):
+#     def __init__(self, num_bits, max_val):
+#         super(FakeQuant, self).__init__()
+#         # self.scale = max_val / (2**(num_bits - 1) - 1)
+#         self.num_bits = num_bits
+#         self.scale = max_val.to(dtype=torch.bfloat16, device=max_val.device)
+
+#     # def forward(self, x,return_features=False):
+#     #     # quantize the input tensor x to the bitwidth
+#     #     x = torch.clamp(x / self.scale, -2**(self.num_bits - 1), 2**(self.num_bits - 1) - 1)
+#     #     x = torch.round(x)
+#     #     # dequantize the tensor x
+#     #     x = x * self.scale
+#     #     return x
+#     def forward(self, x,return_features=False):
+#         x = x / self.scale
+#         # scale_max = self.scale.amax()
+#         x = x * (2**(self.num_bits - 1) - 1)
+#         # quantize the input tensor x to the bitwidth
+#         x = torch.clamp(x, -2**(self.num_bits - 1), 2**(self.num_bits - 1) - 1)
+#         x = torch.round(x)
+#         x = x / (2**(self.num_bits - 1) - 1)
+#         # dequantize the tensor x
+#         x = x * self.scale
+#         return x
 
 
 def insert_fakequant_backbone(model, act_scales, bitwidth, device):
@@ -218,16 +330,7 @@ def insert_fakequant_backbone(model, act_scales, bitwidth, device):
     for i, (name, module) in enumerate(model.backbone._modules.items()):
         if isinstance(module, LSTM):
             scale_key = f'encoder.{name}'
-            if first_lstm:
-                # 第一个LSTM的输入来自Conv，需要额外加input quant
-                model.backbone._modules[name] = torch.nn.Sequential(
-                    FakeQuant(bitwidth, act_scales[scale_key]["input"].to(device)),
-                    module,
-                    FakeQuant(bitwidth, act_scales[scale_key]["output"].to(device))
-                )
-                first_lstm = False
-            else:
-                model.backbone._modules[name] = torch.nn.Sequential(
+            model.backbone._modules[name] = torch.nn.Sequential(
                     module,
                     FakeQuant(bitwidth, act_scales[scale_key]["output"].to(device))
                 )
@@ -322,67 +425,227 @@ class CTC_CRF:
             .reshape(self.n_base, -1).T,
         ], dim=1).to(torch.int32)
 
-    def viterbi_guided_bidirectional_reshape(self, scores, use_bfloat16=True, beam_width=32):
+    # def viterbi_guided_bidirectional_reshape(self, scores, use_bfloat16=True, beam_width=32):
+    #     T, N, _ = scores.shape
+    #     n_states = self.n_base ** self.state_len
+    #     n_alphabet = len(self.alphabet)
+    #     device = scores.device
+    #     idx = self.idx.to(device=device, dtype=torch.long)
+    #     K = beam_width
+
+    #     if not hasattr(self, '_idx_T') or self._idx_T.device != device:
+    #         idx_T = idx.flatten().argsort().reshape(*idx.shape).to(device)
+    #         self._idx_T = idx_T
+    #         self._idx_T_targets = idx_T // n_alphabet
+
+    #     dtype = torch.bfloat16 if use_bfloat16 else torch.float32
+    #     Ms = scores.transpose(1, 2).to(dtype).reshape(T, n_states, n_alphabet, N)
+    #     idx_T = self._idx_T
+    #     idx_T_targets = self._idx_T_targets
+    #     Ms_T = Ms.reshape(T, -1, N)[:, idx_T, :]
+    #     segment_size = 8
+
+    #     # Forward
+    #     alphas_all = torch.zeros(T + 1, n_states, N, device=device, dtype=dtype)
+    #     alpha = alphas_all[0]
+    #     for t in range(T):
+    #         alpha = torch.logsumexp(alpha[idx, :] + Ms[t], dim=1)
+    #         if t % segment_size == 0:
+    #             alpha = alpha - alpha.max(dim=0, keepdim=True)[0]
+    #         alphas_all[t + 1] = alpha
+
+    #     # Backward
+    #     betas_all = torch.zeros(T + 1, n_states, N, device=device, dtype=dtype)
+    #     beta = betas_all[T]
+    #     for t in range(T - 1, -1, -1):
+    #         beta = torch.logsumexp(Ms_T[t] + beta[idx_T_targets, :], dim=1)
+    #         if t % segment_size == 0:
+    #             beta = beta - beta.max(dim=0, keepdim=True)[0]
+    #         betas_all[t] = beta
+
+    #     # Posterior-normalized Viterbi
+    #     alpha_max = torch.full((n_states, N), float('-inf'), device=device, dtype=dtype)
+    #     alpha_max[0, :] = 0.0
+    #     traceback = torch.zeros(T, n_states, N, dtype=torch.int8, device=device)
+    #     for t in range(T):
+    #         edge_post = alphas_all[t][idx, :] + Ms[t] + betas_all[t + 1][:, None, :]
+    #         # 减 max 归一化（轻量数值稳定化）
+    #         flat = edge_post.reshape(-1, N)
+    #         log_post = (flat - flat.max(dim=0, keepdim=True)[0]).reshape(n_states, n_alphabet, N)
+    #         # Viterbi step
+    #         alpha_max, best_z = (alpha_max[idx, :] + log_post).max(dim=1)
+    #         traceback[t] = best_z.to(torch.int8)
+    #         if t % segment_size == 0:
+    #             alpha_max = alpha_max - alpha_max.max(dim=0, keepdim=True)[0]
+
+    #     # Traceback
+    #     current_states = alpha_max.argmax(dim=0)
+    #     paths = torch.zeros(T, N, dtype=torch.int8, device=device)
+    #     batch_idx = torch.arange(N, device=device)
+    #     for t in range(T - 1, -1, -1):
+    #         best_edges = traceback[t, current_states, batch_idx]
+    #         paths[t] = best_edges
+    #         current_states = idx[current_states, best_edges.long()]
+    #     return paths.T.to(torch.long)
+    
+    def viterbi_guided_bidirectional_reshape(self, scores, use_bfloat16=True, return_intermediates=False):
+        """
+        双向引导 Viterbi（精度和速度的平衡，支持 bfloat16）
+         
+        性能优化：
+        - 保留完整的 forward + backward 信息（高精度）
+        - 跳过 softmax 归一化（速度提升 20-30%）
+        - 直接在 log 空间做 Viterbi
+        - 支持 bfloat16 计算（内存和速度优化）
+        - 每10步归一化（数值稳定性）
+         
+        理论依据：
+        alpha + Ms + beta 已经包含完整的双向信息，
+        Viterbi 只需要相对分数，不需要归一化为概率分布
+         
+        介于 viterbi_posteriors 和 viterbi_fused_guided_fast 之间：
+        - 比 posteriors 快（省略 softmax + log）
+        - 比 fused_fast 准确（包含 forward 信息）
+         
+        Args:
+            scores: 输入分数 (T, N, C)
+            use_bfloat16: 是否使用 bfloat16 计算（默认 False，使用 float32）
+ 
+        具体参数值：
+            - T = 1000
+            - N = 512 (batch size)
+            - n_states = 1024
+            - self.state_len = 5
+            - self.n_base = 4
+ 
+ 
+        """
         T, N, _ = scores.shape
         n_states = self.n_base ** self.state_len
         n_alphabet = len(self.alphabet)
         device = scores.device
-        idx = self.idx.to(device=device, dtype=torch.long)
-        K = beam_width
+        # 使用 Moffett 版本生成 idx 和 idx_T
+        if not hasattr(self, '_idx_moffett') or self._idx_moffett.device != device:
+            # init_idx_table 方式生成 idx
+            idx_np = np.zeros((n_states, n_alphabet), dtype=np.int32)
+            idx_np[:, 0] = np.arange(n_states)
+            for j in range(1, n_alphabet):
+                idx_np[:, j] = ((j - 1) * n_states + np.arange(n_states)) // self.n_base
+            self._idx_moffett = torch.from_numpy(idx_np).to(device=device, dtype=torch.long)
 
-        if not hasattr(self, '_idx_T') or self._idx_T.device != device:
-            idx_T = idx.flatten().argsort().reshape(*idx.shape).to(device)
-            self._idx_T = idx_T
-            self._idx_T_targets = idx_T // n_alphabet
+            # get_idx_T_moffett 方式生成 idx_T
+            idx_T_np = np.zeros((n_states, n_alphabet), dtype=np.int32)
+            for i in range(n_states):
+                idx_T_np[i][0] = i * n_alphabet
+            for i in range(n_states):
+                for j in range(self.n_base):
+                    repeat_idx = i * self.n_base + j
+                    repeat_idx_row = repeat_idx % n_states
+                    repeat_idx_col = 1 + repeat_idx // n_states
+                    flatten_idx = repeat_idx_row * n_alphabet + repeat_idx_col
+                    idx_T_np[i][j + 1] = flatten_idx
+            self._idx_T = torch.from_numpy(idx_T_np).to(device=device, dtype=torch.long)
+            self._idx_T_targets = self._idx_T // n_alphabet
 
+        idx = self._idx_moffett
+         
+        # [1000,160,batch_tile,32] # 160*32 -> 5120  batch-size_tile >= 32  --> total_size = 312.5 if batch-size_tile = 32
+        # transpose
+        # [1000,160,32,batch_tile]
+
+        # 选择数据类型
         dtype = torch.bfloat16 if use_bfloat16 else torch.float32
-        Ms = scores.transpose(1, 2).to(dtype).reshape(T, n_states, n_alphabet, N)
+        Ms = scores.transpose(1,2).to(dtype).reshape(T, n_states, n_alphabet, N) # [1000, 512, 5120] --> [1000, 5120, 512] --> [1000, 1024, 5, 512]
+         
         idx_T = self._idx_T
         idx_T_targets = self._idx_T_targets
-        Ms_T = Ms.reshape(T, -1, N)[:, idx_T, :]
+        Ms_flat = Ms.reshape(T, -1, N)
+        Ms_T = Ms_flat[:, idx_T, :]  #5120 维度flatten 后重排
+         
+        # 归一化间隔（bfloat16 需要更频繁的归一化）
+        # 更小的 segment_size = 更频繁的归一化 = 更好的数值稳定性
         segment_size = 8
-
-        # Forward
-        alphas_all = torch.zeros(T + 1, n_states, N, device=device, dtype=dtype)
-        alpha = alphas_all[0]
+         
+        # ========================================
+        # 步骤1: Log Forward (manual_logsumexp + 归一化)
+        # ========================================
+        alphas_all = torch.zeros(T + 1, n_states, N, device=device, dtype=dtype) #[1001,1024,512]
+        alpha = alphas_all[0]  # 初始状态全为0
+ 
+        #alpha : [1024,512]
+         
         for t in range(T):
-            alpha = torch.logsumexp(alpha[idx, :] + Ms[t], dim=1)
+            alpha_indexed = alpha[idx, :] # 在1024 维度重排
+            candidates = alpha_indexed + Ms[t]
+            alpha = manual_logsumexp(candidates, dim=1)
+             
+            # 每 segment_size 步归一化（保持数值稳定）
             if t % segment_size == 0:
-                alpha = alpha - alpha.max(dim=0, keepdim=True)[0]
+                alpha_min = alpha.min(dim=0, keepdim=True)[0]
+                alpha = alpha - alpha_min
+             
             alphas_all[t + 1] = alpha
-
-        # Backward
-        betas_all = torch.zeros(T + 1, n_states, N, device=device, dtype=dtype)
-        beta = betas_all[T]
+         
+        # ========================================
+        # 步骤2: Log Backward (manual_logsumexp + 归一化)
+        # ========================================
+        betas_all = torch.zeros(T + 1, n_states, N, device=device, dtype=dtype) #[1001,1024,512]
+        beta = betas_all[T]  # 终止状态全为0
+         
         for t in range(T - 1, -1, -1):
-            beta = torch.logsumexp(Ms_T[t] + beta[idx_T_targets, :], dim=1)
+            beta_indexed = beta[idx_T_targets, :]
+            candidates = Ms_T[t] + beta_indexed
+            beta = manual_logsumexp(candidates, dim=1)
+             
+            # 每 segment_size 步归一化（保持数值稳定）
             if t % segment_size == 0:
-                beta = beta - beta.max(dim=0, keepdim=True)[0]
+                beta_min = beta.min(dim=0, keepdim=True)[0]
+                beta = beta - beta_min
+             
             betas_all[t] = beta
-
-        # Posterior-normalized Viterbi
-        alpha_max = torch.full((n_states, N), float('-inf'), device=device, dtype=dtype)
+         
+        # ========================================
+        # 步骤3 + 4: 融合计算引导分数并做 Viterbi forward
+        # 避免额外的内存分配，直接在线计算
+        # ========================================
+        alpha_max = torch.full((n_states, N), float('-inf'), device=device, dtype=dtype) #[1024,512]
         alpha_max[0, :] = 0.0
         traceback = torch.zeros(T, n_states, N, dtype=torch.int8, device=device)
+         
         for t in range(T):
-            edge_post = alphas_all[t][idx, :] + Ms[t] + betas_all[t + 1][:, None, :]
-            # 减 max 归一化（轻量数值稳定化）
-            flat = edge_post.reshape(-1, N)
-            log_post = (flat - flat.max(dim=0, keepdim=True)[0]).reshape(n_states, n_alphabet, N)
-            # Viterbi step
-            alpha_max, best_z = (alpha_max[idx, :] + log_post).max(dim=1)
+            # 在线计算 guided_scores = alpha[src] + Ms + beta[dst]
+            alpha_indexed_src = alphas_all[t][idx, :]
+            beta_indexed_dst = betas_all[t + 1][:, None, :]
+            guided_scores_t = alpha_indexed_src + Ms[t] + beta_indexed_dst
+             
+            # Viterbi forward: alpha_max[dst] = max(alpha_max[src] + guided_scores)
+            alpha_indexed_max = alpha_max [idx, :]
+            candidates = alpha_indexed_max + guided_scores_t
+            alpha_max, best_z = candidates.max(dim=1)  # 用 float 保证精度
             traceback[t] = best_z.to(torch.int8)
-            if t % segment_size == 0:
-                alpha_max = alpha_max - alpha_max.max(dim=0, keepdim=True)[0]
-
-        # Traceback
+ 
+            if t % 8 == 0:
+                alpha_max = alpha_max-alpha_max.max(dim=0, keepdim=True)[0]
+ 
+        # ========================================
+        # 步骤5: 回溯得到最优路径 (CPU)
+        # ========================================
         current_states = alpha_max.argmax(dim=0)
         paths = torch.zeros(T, N, dtype=torch.int8, device=device)
         batch_idx = torch.arange(N, device=device)
+         
         for t in range(T - 1, -1, -1):
             best_edges = traceback[t, current_states, batch_idx]
             paths[t] = best_edges
             current_states = idx[current_states, best_edges.long()]
+
+        # if return_intermediates:
+        #     return paths.T.to(torch.long), {
+        #         "alphas_all": alphas_all,
+        #         "betas_all": betas_all,
+        #         "alpha_max": alpha_max,
+        #         "paths": paths.T.to(torch.long),
+        #     }
         return paths.T.to(torch.long)
 
     def path_to_str(self, path):
@@ -442,7 +705,8 @@ class Model(Module):
         return x
 
     def decode_batch(self, scores, use_koi=False, beam_width=32, beam_cut=100.0,
-                     scale=1.0, offset=0.0, blank_score=2.0, use_bfloat16=True):
+                     scale=1.0, offset=0.0, blank_score=2.0, use_bfloat16=True,
+                     return_intermediates=False):
         """
         Decode a batch of scores using either koi beam_search or viterbi decoding.
 
@@ -502,6 +766,12 @@ class Model(Module):
             else:
                 # ---- Viterbi decoding path ----
                 dtype = torch.bfloat16 if use_bfloat16 else torch.float32
+                # if return_intermediates:
+                #     paths, intermediates = self.seqdist.viterbi_guided_bidirectional_reshape(
+                #         scores.to(dtype), use_bfloat16=use_bfloat16, return_intermediates=True
+                #     )
+                #     decoded = [self.seqdist.path_to_str(path) for path in paths.cpu().numpy()]
+                #     return decoded, intermediates
                 paths = self.seqdist.viterbi_guided_bidirectional_reshape(
                     scores.to(dtype), use_bfloat16=use_bfloat16
                 )
@@ -525,8 +795,15 @@ def load_model(config, weight_path, device, half=False):
     return model
 
 
-def load_quant_model(config, io_quant_path, act_scales_path, device, half=False, bitwidth=8):
-    """Load a model with FakeQuant layers inserted (produced by lstmIOquant_jjy.py)."""
+def load_quant_model(config, io_quant_path, act_scales_path, device,
+                     half=False, bf16=False, bitwidth=8):
+    """Load a model with FakeQuant layers inserted.
+
+    Args:
+        half: convert to float16.
+        bf16:  convert to bfloat16 (replaces torch.nn.LSTM with ManualLSTMRNN
+               first, since CUDA LSTM kernel doesn't support bf16).
+    """
     device = torch.device(device)
     model = Model(config)
 
@@ -539,7 +816,10 @@ def load_quant_model(config, io_quant_path, act_scales_path, device, half=False,
     state_dict = {k2: state_dict[k1] for k1, k2 in match_names(state_dict, model).items()}
     model.load_state_dict(state_dict)
 
-    if half:
+    if bf16:
+        replace_lstm_with_manual(model)
+        model = model.bfloat16()
+    elif half:
         model = model.half()
     model.eval()
     model.to(device)
@@ -638,7 +918,8 @@ class TrainingDataSet3(Dataset):
 # ============================================================
 
 def model_eval(dataloader, model, is_half, device, use_koi=False,
-               beam_width=32, beam_cut=100.0, scale=1.0, offset=0.0, blank_score=2.0):
+               beam_width=32, beam_cut=100.0, scale=1.0, offset=0.0, blank_score=2.0,
+               use_bf16=False):
     targets, seqs = [], []
     t0 = time.perf_counter()
     total_samples = 0
@@ -647,19 +928,41 @@ def model_eval(dataloader, model, is_half, device, use_koi=False,
     accuracy_with_cov = lambda ref, seq: accuracy(ref, seq, min_coverage=0.95)
 
     with torch.no_grad():
-        for data, target, *_ in dataloader:
+        for data, target, lengths in dataloader:
             targets.extend(torch.unbind(target, 0))
-            data = data.type(torch.float16).to(device) if is_half else data.to(device)
+            if use_bf16:
+                data = data.to(torch.bfloat16).to(device)
+            elif is_half:
+                data = data.to(torch.float16).to(device)
+            else:
+                data = data.to(device)
             total_samples += data.shape[0] * data.shape[2]
 
             # backbone (CNN + LSTM) → crfencoder (LinearCRFEncoder) → decode
             x = model.backbone(data)
             scores = model.crfencoder(x)
-            seqs.extend(model.decode_batch(
+            decoded = model.decode_batch(
                 scores, use_koi=use_koi, beam_width=beam_width,
                 beam_cut=beam_cut, scale=scale, offset=offset,
                 blank_score=blank_score,
-            ))
+            )
+            seqs.extend(decoded)
+
+            break
+
+            # save_dict = {
+            #     "backbone_output": x.cpu(),
+            #     "scores": scores.cpu(),
+            #     "alphas_all": intermediates["alphas_all"].cpu(),
+            #     "betas_all": intermediates["betas_all"].cpu(),
+            #     "alpha_max": intermediates["alpha_max"].cpu(),
+            #     "paths": intermediates["paths"].cpu(),
+            # }
+            # save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viterbi_intermediates.pt")
+            # torch.save(save_dict, save_path)
+            # print(f"[Saved intermediates to {save_path}]")
+            # for k, v in save_dict.items():
+            #     print(f"  {k}: shape={tuple(v.shape)}, dtype={v.dtype}")
 
     duration = time.perf_counter() - t0
     refs = [decode_ref(t, model.alphabet) for t in targets]
@@ -679,6 +982,28 @@ def model_eval(dataloader, model, is_half, device, use_koi=False,
     return res_mean, res_median, duration, res_speed, res_base_speed, len(refs)
 
 
+
+def get_idx_T_moffett():
+    idx_T = np.zeros((1024, 5), dtype=np.int32)
+    for i in range(1024):
+        idx_T[i][0] = i * 5
+    for i in range(1024):
+        for j in range(4):
+            repeat_idx = i * 4 + j
+            repeat_idx_row = repeat_idx % 1024
+            repeat_idx_col = 1 + repeat_idx // 1024
+            flatten_idx = repeat_idx_row * 5 + repeat_idx_col
+            idx_T[i][j + 1] = flatten_idx
+    idx_T_targets = idx_T // 5
+    return idx_T, idx_T_targets
+
+
+def init_idx_table(n_states=1024, state_len=5, n_base=4):
+    idx = np.zeros((n_states, state_len), dtype=np.int32)
+    idx[:, 0] = np.arange(n_states)
+    for j in range(1, state_len):
+        idx[:, j] = ((j - 1) * n_states + np.arange(n_states)) // n_base
+    return idx.flatten()
 # ============================================================
 # CLI
 # ============================================================
@@ -689,9 +1014,11 @@ def get_parser():
                         help="Directory containing config.toml, io_quant.pth, act_scales.pth")
     parser.add_argument("--data_dir", type=str, required=True,
                         help="Data dir (should end with 'train', val is auto-detected)")
-    parser.add_argument("--val_batch_size", type=int, default=16)
+    parser.add_argument("--val_batch_size", type=int, default=512)
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--use_half", action="store_true", default=True)
+    parser.add_argument("--use_half", action="store_true", default=False)
+    parser.add_argument("--use_bf16", action="store_true", default=True,
+                        help="Use bfloat16 precision (replaces LSTM with ManualLSTMRNN)")
     parser.add_argument("--seed", type=int, default=25)
 
     # Beam search arguments
@@ -715,8 +1042,8 @@ def main():
 
     MODEL_DIR = args.model_dir
     CONFIG_PATH = os.path.join(MODEL_DIR, "config.toml")
-    IO_QUANT_PATH = os.path.join(MODEL_DIR, "layer_9_6x_io_quant.pth")
-    ACT_SCALES_PATH = os.path.join(MODEL_DIR, "layer_9_6x_act_scales.pth")
+    IO_QUANT_PATH = "/workspace/huada/scall/caoyu/layer_9_6x_io_quant_0305.pth"
+    ACT_SCALES_PATH = "/workspace/huada/scall/caoyu/layer_9_6x_act_scales_0305.pth"
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -742,6 +1069,7 @@ def main():
         act_scales_path=ACT_SCALES_PATH,
         device=args.device,
         half=args.use_half,
+        bf16=args.use_bf16,
     )
     print(f"Quantized model loaded: {type(model).__name__}")
 
@@ -760,7 +1088,8 @@ def main():
     print(f"Model: {MODEL_DIR}")
     print(f"Weights: {IO_QUANT_PATH}")
     print(f"Act scales: {ACT_SCALES_PATH}")
-    print(f"Device: {args.device}, Half: {args.use_half}")
+    dtype_str = "bf16" if args.use_bf16 else ("fp16" if args.use_half else "fp32")
+    print(f"Device: {args.device}, dtype: {dtype_str}")
     print(f"Decode: {'beam_search (koi)' if (args.use_koi and KOI_AVAILABLE) else 'viterbi'}")
     if args.use_koi and KOI_AVAILABLE:
         print(f"  beam_width={args.beam_width}, beam_cut={args.beam_cut}, "
@@ -775,6 +1104,7 @@ def main():
         scale=args.scale,
         offset=args.offset,
         blank_score=args.blank_score,
+        use_bf16=args.use_bf16,
     )
 
     print(f"\n{'='*60}")

@@ -66,6 +66,32 @@ def clip_gradient(optimizer, grad_clip):
                 param.grad.data.clamp_(-grad_clip, grad_clip)
 
 
+def fake_quantize_int8(weight):
+    """INT8 per-tensor symmetric fake quantization with STE.
+    
+    Forward: returns quantize-then-dequantize value (simulates INT8 precision loss).
+    Backward: gradient passes through to the original weight (straight-through estimator).
+    """
+    amax = weight.abs().max()
+    if amax == 0:
+        return weight
+    scale = amax / 127.0
+    weight_q = torch.clamp(torch.round(weight / scale), -127, 127)
+    # STE trick: (quantized - original).detach() + original
+    # Forward uses quantized value; backward gradient flows to original weight
+    return (weight_q * scale - weight).detach() + weight
+
+
+def fake_quantize_int8_detached(weight):
+    """INT8 per-tensor symmetric fake quantization (no gradient, for inference/saving)."""
+    amax = weight.abs().max()
+    if amax == 0:
+        return weight.clone()
+    scale = amax / 127.0
+    weight_q = torch.clamp(torch.round(weight / scale), -127, 127)
+    return weight_q * scale
+
+
 class AverageMeter:
     """计算并存储平均值和当前值"""
     def __init__(self):
@@ -230,10 +256,15 @@ class Trainer:
         self._setup_directories()
         self._setup_data()
         self._setup_model()
+        if self.args.qat_int8:
+            self._load_qat_weights()  # QAT: 先加载权重, 再初始化 optimizer
         self._setup_optimizer()
         self._setup_checkpoint()
         self._try_resume()  # 必须在 pruner 之前恢复模型/优化器状态
-        self._setup_pruner()  # pruner 需要使用正确的模型状态
+        if self.args.qat_int8:
+            self._setup_qat()  # QAT 模式: 注册 fake quantization hooks
+        else:
+            self._setup_pruner()  # pruner 需要使用正确的模型状态
     
     def _setup_distributed(self):
         """初始化分布式训练"""
@@ -333,20 +364,16 @@ class Trainer:
     
     def _setup_optimizer(self):
         """初始化优化器和学习率调度器"""
-        # 与原始代码保持一致: 使用默认的 AdamW 参数
+        # 稀疏的改成0，其它的不变
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), 
-            lr=self.args.lr
+            lr=self.args.lr,
+            weight_decay=1e-2,
         )
         
-        # 注意：使用梯度累积时，lr_scheduler.step() 只在参数更新时调用
-        # 所以 total_steps 需要除以 grad_accum
+        # Linear Warmup + Cosine Decay (与 train_index_ddp_sparse.py 一致)
         effective_steps_per_epoch = self.data_len // self.args.grad_accum
         total_steps = effective_steps_per_epoch * self.args.epoch_num
-        
-        if self.is_main_process:
-            print(f"[LR Scheduler] Effective steps per epoch: {effective_steps_per_epoch}, Total steps: {total_steps}")
-        
         self.lr_scheduler = get_lr_scheduler(
             epochs=total_steps,
             optimizer=self.optimizer,
@@ -355,6 +382,11 @@ class Trainer:
             end_ratio=0.01,
             warmup_steps=self.args.warmup_steps,
         )
+        
+        if self.is_main_process:
+            print(f"[LR Scheduler] Linear Warmup + Cosine Decay: "
+                  f"lr={self.args.lr}, end_ratio=0.01, "
+                  f"warmup={self.args.warmup_steps}, total_steps={total_steps}")
         
         # 混合精度训练
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.args.use_amp)
@@ -379,8 +411,28 @@ class Trainer:
             "encoder.0.conv.weight": 0,
             "encoder.1.conv.weight": 0,
             "encoder.2.conv.weight": 0,
-            "encoder.9.linear.weight": 0,
         }
+        
+        # 设置最后一个 linear 层的稀疏率
+        if self.args.last_linear_sparsity is not None:
+            # 动态查找最后一个 linear.weight 层的名字
+            last_linear_name = None
+            for name, _ in self.model_orig.named_parameters():
+                if 'linear.weight' in name:
+                    last_linear_name = name
+            if last_linear_name is not None:
+                prune_dict[last_linear_name] = self.args.last_linear_sparsity
+                if self.is_main_process:
+                    if self.args.last_linear_sparsity == 0:
+                        print(f"[Pruner] Last linear '{last_linear_name}' excluded from pruning")
+                    else:
+                        multiplier = 1.0 / (1.0 - self.args.last_linear_sparsity) if self.args.last_linear_sparsity < 1.0 else float('inf')
+                        print(f"[Pruner] Last linear '{last_linear_name}' sparsity={self.args.last_linear_sparsity:.4f} ({multiplier:.1f}x)")
+                
+                # Resume 时从高稀疏率 → 低稀疏率：重新初始化被剪枝的零权重
+                # 否则 BBS 的 mask 机制会让零权重永远无法恢复
+                if self.args.resume and 0 < self.args.last_linear_sparsity < 1.0:
+                    self._reinit_pruned_weights(last_linear_name, self.args.last_linear_sparsity)
         
         # 检查是否有 pruner 检查点需要恢复
         pruner_resume_dict = None
@@ -411,6 +463,16 @@ class Trainer:
             pruner_resume_dict=pruner_resume_dict,
         )
         
+        # 修复：pruner_resume_dict 路径中 PrunerScheduler.__init__ 内部
+        # load_state_dict 会把旧 base_lrs 恢复，这里统一覆盖为当前 LR
+        if pruner_resume_dict is not None:
+            idx = self.pruner.index
+            self.pruner.optim_schedulers[idx].base_lrs = [
+                group['initial_lr'] for group in self.optimizer.param_groups
+            ]
+            if self.is_main_process:
+                print(f"[Resume] Fixed pruner scheduler base_lrs to {self.pruner.optim_schedulers[idx].base_lrs}")
+        
         # Resume 时将 global_step 同步给 pruner
         # PrunerScheduler.step 和 Trainer.global_step 是 1:1 递增的，
         # 但 pruner 没有独立的 save/load，所以利用已保存的 global_step 恢复
@@ -418,8 +480,205 @@ class Trainer:
             self.pruner.step = self.global_step
             self.pruner.resume_tag = True
             self.pruner.init_pruner()
+            
+            # 修复：将 pruner 的 LR scheduler 推进到正确的位置
+            # 不推进的话，scheduler 从 step 0 重新开始，会在 fine-tune 阶段返回 1.0（全量 LR），
+            # 导致恢复训练后 LR 恒定为 initial_lr，loss 无法下降
+            idx = self.pruner.index
+            steps_into_stage = self.global_step - self.pruner.stage_wise_steps[idx][0]
+            
+            # 优先从主检查点中恢复 pruner scheduler 状态
+            resumed_from_ckpt = False
+            if hasattr(self, '_resume_pruner_state') and self._resume_pruner_state is not None:
+                try:
+                    saved_state = self._resume_pruner_state
+                    if saved_state['index'] == idx:
+                        self.pruner.optim_schedulers[idx].load_state_dict(
+                            saved_state['lr_scheduler_state']
+                        )
+                        # 修复：load_state_dict 会把旧 checkpoint 的 base_lrs 一并恢复，
+                        # 如果 resume 时换了 LR（如从 5e-4 改为 4e-6），base_lrs 会被污染。
+                        # 这里强制用当前 optimizer 的 initial_lr 覆盖。
+                        self.pruner.optim_schedulers[idx].base_lrs = [
+                            group['initial_lr'] for group in self.optimizer.param_groups
+                        ]
+                        resumed_from_ckpt = True
+                        if self.is_main_process:
+                            print(f"[Resume] Restored pruner LR scheduler state from main checkpoint")
+                except Exception as e:
+                    if self.is_main_process:
+                        print(f"[Resume] Could not restore pruner scheduler state ({e}), advancing manually")
+            
+            # 若无法从检查点恢复，则手动推进 scheduler 步数
+            if not resumed_from_ckpt and steps_into_stage > 0:
+                for _ in range(steps_into_stage):
+                    self.pruner.optim_schedulers[idx].step()
+                if self.is_main_process:
+                    print(f"[Resume] Manually advanced pruner LR scheduler by {steps_into_stage} steps")
+            
             if self.is_main_process:
+                current_lr = self.optimizer.param_groups[0]['lr']
+                stage_info = self.pruner.stage_wise_steps[idx]
+                prune_end = stage_info[1]
+                finetune_end = stage_info[2]
+                phase = "pruning" if self.global_step < prune_end else "fine-tuning"
                 print(f"[Resume] Synced pruner step to global_step={self.global_step}")
+                print(f"[Resume] Stage [{stage_info[0]}, prune_end={prune_end}, total_end={finetune_end}], "
+                      f"phase={phase}, steps_into_stage={steps_into_stage}")
+                print(f"[Resume] Pruner LR after sync: {current_lr:.2e}")
+    
+    def _load_qat_weights(self):
+        """加载 QAT 预训练权重.
+        
+        必须在 _setup_optimizer() 之前调用, 确保 optimizer 初始化时看到正确的权重,
+        避免 optimizer 内部状态 (momentum, variance) 与实际权重不匹配.
+        """
+        if self.args.qat_weight_path and os.path.exists(self.args.qat_weight_path):
+            if self.is_main_process:
+                self._log(f"[QAT] Loading pretrained weights from: {self.args.qat_weight_path}")
+            state_dict = torch.load(self.args.qat_weight_path, map_location=f'cuda:{self.local_rank}')
+            self.model_orig.load_state_dict(state_dict)
+            if self.is_main_process:
+                self._log("[QAT] Pretrained weights loaded successfully")
+        elif self.is_main_process:
+            self._log("[QAT] Warning: qat_weight_path not set or not found, using current model weights")
+
+    def _setup_qat(self):
+        """注册 INT8 weight QAT forward hooks.
+        
+        对 LSTM weights 和 LinearCRFEncoder 的 linear weight 做 INT8 fake quantization.
+        训练时通过 save/restore 方式实现 STE, 保证梯度回传到原始 FP32 权重.
+        
+        实现原理:
+          - forward pre-hook 中将原始 FP32 权重备份, 替换为量化值用于 forward
+          - forward post-hook 中将原始 FP32 权重恢复
+          - backward 时梯度作用在原始 FP32 权重上 (等效 STE)
+          
+        注意: 不能在 hook 中用 fake_quantize_int8 的 STE trick + .data= 赋值,
+        因为 .data= 脱离计算图, autograd 看不到, STE 梯度完全失效,
+        且原始 FP32 权重会被永久覆盖为量化值, 精度不断截断累积.
+        """
+        # 收集需要量化的模块
+        from opencall.models.common.nn import LSTM as LSTM_Module, LinearCRFEncoder
+        
+        qat_targets = []
+        for name, module in self.model_orig.named_modules():
+            if isinstance(module, LSTM_Module):
+                qat_targets.append((name, module, 'lstm'))
+            elif isinstance(module, LinearCRFEncoder):
+                qat_targets.append((name, module, 'linear_crf'))
+        
+        if self.is_main_process:
+            self._log(f"[QAT] Found {len(qat_targets)} modules to quantize:")
+            for name, _, mtype in qat_targets:
+                self._log(f"  - {name} ({mtype})")
+        
+        # 注册 forward pre-hooks + post-hooks (save/restore 方式实现 STE)
+        # pre-hook: 备份原始 FP32 权重, 替换为 INT8 量化值
+        # post-hook: 恢复原始 FP32 权重, 使 backward 梯度作用在原始权重上
+        self._qat_hooks = []
+        for name, module, mtype in qat_targets:
+            if mtype == 'lstm':
+                def lstm_pre_hook(mod, inputs, module_name=name):
+                    # 备份原始 FP32 权重
+                    mod._qat_saved_weight_ih = mod.rnn.weight_ih_l0.data.clone()
+                    mod._qat_saved_weight_hh = mod.rnn.weight_hh_l0.data.clone()
+                    # 替换为 INT8 量化值 (detached, 用于 forward 计算)
+                    mod.rnn.weight_ih_l0.data = fake_quantize_int8_detached(mod.rnn.weight_ih_l0.data)
+                    mod.rnn.weight_hh_l0.data = fake_quantize_int8_detached(mod.rnn.weight_hh_l0.data)
+                def lstm_post_hook(mod, inputs, outputs, module_name=name):
+                    # 恢复原始 FP32 权重, 使 backward 梯度作用在原始权重上
+                    mod.rnn.weight_ih_l0.data = mod._qat_saved_weight_ih
+                    mod.rnn.weight_hh_l0.data = mod._qat_saved_weight_hh
+                    del mod._qat_saved_weight_ih, mod._qat_saved_weight_hh
+                self._qat_hooks.append(module.register_forward_pre_hook(lstm_pre_hook))
+                self._qat_hooks.append(module.register_forward_hook(lstm_post_hook))
+            elif mtype == 'linear_crf':
+                def linear_pre_hook(mod, inputs, module_name=name):
+                    mod._qat_saved_weight = mod.linear.weight.data.clone()
+                    mod.linear.weight.data = fake_quantize_int8_detached(mod.linear.weight.data)
+                def linear_post_hook(mod, inputs, outputs, module_name=name):
+                    mod.linear.weight.data = mod._qat_saved_weight
+                    del mod._qat_saved_weight
+                self._qat_hooks.append(module.register_forward_pre_hook(linear_pre_hook))
+                self._qat_hooks.append(module.register_forward_hook(linear_post_hook))
+        
+        if self.is_main_process:
+            self._log(f"[QAT] Registered {len(self._qat_hooks)} hooks (pre+post) for INT8 fake quantization")
+        
+        # 记录初始稀疏 mask (True = 该位置是零, 需要保持稀疏)
+        # optimizer step 后调用 _apply_sparsity_masks() 恢复这些位置为零
+        self._sparsity_masks = {}
+        total_sparse = 0
+        total_params = 0
+        for name, param in self.model_orig.named_parameters():
+            mask = (param.data == 0)
+            n_sparse = mask.sum().item()
+            if n_sparse > 0:
+                self._sparsity_masks[name] = mask
+                total_sparse += n_sparse
+            total_params += param.numel()
+        
+        if self.is_main_process:
+            sparsity_ratio = total_sparse / total_params if total_params > 0 else 0
+            self._log(f"[QAT] Sparsity masks captured: {len(self._sparsity_masks)} tensors, "
+                      f"overall sparsity={sparsity_ratio:.4f} ({total_sparse:,}/{total_params:,})")
+
+    def _apply_sparsity_masks(self):
+        """将 optimizer step 后被更新的稀疏零位置重新置零."""
+        if not hasattr(self, '_sparsity_masks'):
+            return
+        with torch.no_grad():
+            for name, param in self.model_orig.named_parameters():
+                if name in self._sparsity_masks:
+                    param.data[self._sparsity_masks[name]] = 0.0
+    
+    def _reinit_pruned_weights(self, layer_name: str, target_sparsity: float):
+        """
+        当 resume 从高稀疏率 checkpoint 训练到低稀疏率时，
+        重新初始化已经被剪枝为零的权重，让 BBS pruner 能正确工作。
+        
+        原因：BBS 在每个 prune step 先用旧 mask 把零权重置零，然后按 topk(abs) 选择保留权重。
+        已经是零的权重绝对值为 0，永远不会被选中，导致稀疏率无法从高降到低。
+        
+        策略：用非零权重绝对值均值的 1% 作为初始化尺度，足够小不影响模型输出，
+        又足够大让 pruner 可以"看到"这些权重并参与选择。
+        """
+        for name, param in self.model_orig.named_parameters():
+            if name != layer_name:
+                continue
+            
+            with torch.no_grad():
+                weight = param.data
+                zero_mask = (weight == 0)
+                current_sparsity = zero_mask.float().mean().item()
+                
+                if current_sparsity <= target_sparsity:
+                    if self.is_main_process:
+                        print(f"[Reinit] '{name}' current sparsity {current_sparsity:.4f} "
+                              f"<= target {target_sparsity:.4f}, no reinit needed")
+                    return
+                
+                # 用非零权重的统计量初始化
+                nonzero_weights = weight[~zero_mask]
+                if nonzero_weights.numel() == 0:
+                    if self.is_main_process:
+                        print(f"[Reinit] WARNING: '{name}' has all-zero weights, using default init")
+                    init_scale = 0.01
+                else:
+                    init_scale = nonzero_weights.abs().mean().item() * 0.01
+                
+                # 只重新初始化零权重位置
+                reinit_values = torch.randn_like(weight) * init_scale
+                weight[zero_mask] = reinit_values[zero_mask]
+                
+                new_sparsity = (weight == 0).float().mean().item()
+                if self.is_main_process:
+                    print(f"[Reinit] '{name}': sparsity {current_sparsity:.4f} → {new_sparsity:.4f} "
+                          f"(target: {target_sparsity:.4f})")
+                    print(f"[Reinit] Non-zero weight scale: mean_abs={nonzero_weights.abs().mean().item():.6f}, "
+                          f"reinit_scale={init_scale:.6f}")
+            break
     
     def _setup_checkpoint(self):
         """初始化检查点管理器"""
@@ -443,35 +702,17 @@ class Trainer:
         self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         self.scaler.load_state_dict(ckpt['scaler_state_dict'])
         
-        # 恢复学习率调度器状态
-        # 方法：重新创建 scheduler 并设置正确的 start_step
-        # 这比循环调用 step() 更高效，且与原始实现一致
-        effective_steps_per_epoch = self.data_len // self.args.grad_accum
-        total_steps = effective_steps_per_epoch * self.args.epoch_num
+        # 保存 pruner 状态供 _setup_pruner 使用
+        self._resume_pruner_state = ckpt.get('pruner_state', None)
         
-        # 重新创建 scheduler，从正确的 step 开始
-        from opencall.models.common.schedule import func_scheduler, cosine_decay_schedule, piecewise_schedule, linear_schedule
-        
-        func = cosine_decay_schedule(1.0, 0.01)  # end_ratio=0.01
-        warmup_steps = self.args.warmup_steps
-        if warmup_steps:
-            y0 = func(0.0)
-            func = piecewise_schedule(
-                [warmup_steps / total_steps], 
-                [linear_schedule(0.1 * y0, y0), func]  # warmup_ratio=0.1
-            )
-        
-        from torch.optim.lr_scheduler import LambdaLR
-        # 注意：必须在 lambda 外部捕获 start_step，否则会引用变化的 self.global_step
-        start_step = self.global_step
-        self.lr_scheduler = LambdaLR(
-            self.optimizer, 
-            lambda step, s=start_step: func((step + s) / total_steps)
-        )
+        # 快进 lr_scheduler 到恢复位置
+        if self.global_step > 0:
+            for _ in range(self.global_step):
+                self.lr_scheduler.step()
         
         if self.is_main_process:
             print(f"[Resume] Loaded checkpoint from epoch {self.epoch}, step {self.global_step}")
-            print(f"[Resume] LR scheduler recreated with start_step={self.global_step}, current LR: {self.lr_scheduler.get_last_lr()[0]:.2e}")
+            print(f"[Resume] LR after resume: {self.optimizer.param_groups[0]['lr']:.2e}")
     
     @property
     def is_main_process(self) -> bool:
@@ -581,7 +822,7 @@ class Trainer:
                 pbar.update(1)
                 pbar.set_postfix({
                     'loss': f'{loss:.4f}',
-                    'lr': f'{self.lr_scheduler.get_last_lr()[0]:.2e}',
+                    'lr': f'{self._current_lr():.2e}',
                     'throughput': f'{throughput:.0f}'
                 })
             
@@ -652,10 +893,12 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
-            # 学习率更新 (与原始代码一致: 每个 batch 后更新)
-            self.lr_scheduler.step()
+            # QAT 稀疏保护: optimizer step 会把稀疏零位置更新为非零, 这里恢复
+            if self.args.qat_int8:
+                self._apply_sparsity_masks()
             
-            # 剪枝
+            # 学习率更新 & 剪枝 (与 train_index_ddp_sparse.py 一致：先 step scheduler，再 prune)
+            self.lr_scheduler.step()
             if self.pruner is not None:
                 self.pruner.prune()
             
@@ -664,15 +907,19 @@ class Trainer:
             # Tensorboard
             if self.is_main_process and self.log_writer and self.global_step % 100 == 0:
                 self.log_writer.add_scalar("train/loss", losses["loss"].item(), self.global_step)
-                self.log_writer.add_scalar("train/lr", self.lr_scheduler.get_last_lr()[0], self.global_step)
+                self.log_writer.add_scalar("train/lr", self._current_lr(), self.global_step)
                 self.log_writer.add_scalar("train/throughput", self.throughput_meter.avg, self.global_step)
         
         return losses["loss"].item()
     
+    def _current_lr(self) -> float:
+        """获取当前实际学习率 (直接读 optimizer，避免 pruner/trainer 双 scheduler 不一致)"""
+        return self.optimizer.param_groups[0]['lr']
+    
     def _log_step(self, batch_idx: int):
         """记录训练步骤日志"""
         progress = batch_idx / self.data_len * 100
-        lr = self.lr_scheduler.get_last_lr()[0]
+        lr = self._current_lr()
         
         msg = (
             f"Epoch [{self.epoch}/{self.args.epoch_num}] "
@@ -686,6 +933,35 @@ class Trainer:
         self._log(msg)
         print(msg)
     
+    def _quantize_state_dict(self, state_dict):
+        """对 state_dict 中 QAT 目标层的 weight 做 INT8 量化反量化.
+        
+        用于保存权重时确保 evaluation 加载的权重也经过量化,
+        保持训练和评估的一致性.
+        
+        量化目标 (与 _setup_qat hooks 一致):
+          - LSTM: rnn.weight_ih_l0, rnn.weight_hh_l0
+          - LinearCRFEncoder: linear.weight
+          
+        注意: Serial (nn.Sequential) 用数字索引命名子模块, 所以 key 形如
+        'encoder.9.linear.weight', 不含 'linear_crf' 字样.
+        """
+        if not self.args.qat_int8:
+            return state_dict
+        
+        quantized = {}
+        for key, value in state_dict.items():
+            # LSTM weights
+            if 'rnn.weight_ih_l0' in key or 'rnn.weight_hh_l0' in key:
+                quantized[key] = fake_quantize_int8_detached(value)
+            # LinearCRFEncoder's linear.weight
+            # 在 rnn_encoder 架构中, 只有 LinearCRFEncoder 有 linear.weight 结尾的 key
+            elif key.endswith('linear.weight'):
+                quantized[key] = fake_quantize_int8_detached(value)
+            else:
+                quantized[key] = value
+        return quantized
+    
     def _validate_only(self):
         """只执行验证，不保存模型（用于训练开始前的初始验证）
         
@@ -695,7 +971,8 @@ class Trainer:
             return
         
         weights_path = os.path.join(self.res_dir, "weights_init.tar")
-        torch.save(self.model.module.state_dict(), weights_path)
+        model_state = self._quantize_state_dict(self.model.module.state_dict())
+        torch.save(model_state, weights_path)
         
         res = model_eval(
             dataloader=self.valid_loader,
@@ -724,8 +1001,8 @@ class Trainer:
         if not self.is_main_process:
             return
         
-        # 保存模型权重
-        model_state = self.model.module.state_dict()
+        # 保存模型权重 (QAT 模式下对目标权重做 INT8 量化反量化)
+        model_state = self._quantize_state_dict(self.model.module.state_dict())
         weights_path = os.path.join(self.res_dir, f"weights_{self.epoch}.tar")
         torch.save(model_state, weights_path)
         
@@ -768,6 +1045,16 @@ class Trainer:
             'scaler_state_dict': self.scaler.state_dict(),
             'args': vars(self.args),
         }
+        
+        # 保存 pruner 状态，以便 resume 时正确恢复 LR scheduler
+        if self.pruner is not None:
+            idx = self.pruner.index
+            state['pruner_state'] = {
+                'step': self.pruner.step,
+                'index': idx,
+                'lr_scheduler_state': self.pruner.optim_schedulers[idx].state_dict(),
+            }
+        
         self.ckpt_manager.save(state, self.epoch, self.global_step, is_best)
         
         # 保存训练参数和评估结果
@@ -808,11 +1095,13 @@ class Trainer:
         
         if best_ckpt:
             self.model.module.load_state_dict(best_ckpt['model_state_dict'])
-            torch.save(best_ckpt['model_state_dict'], best_weights_path)
+            best_state = self._quantize_state_dict(best_ckpt['model_state_dict'])
+            torch.save(best_state, best_weights_path)
             self._log("[Final Evaluation] Using best model")
         else:
             # 没有最佳检查点，使用最后的模型
-            torch.save(self.model.module.state_dict(), best_weights_path)
+            last_state = self._quantize_state_dict(self.model.module.state_dict())
+            torch.save(last_state, best_weights_path)
             self._log("[Final Evaluation] Using last model (no best checkpoint)")
         
         res = model_eval(
@@ -852,7 +1141,8 @@ def get_parser():
     parser.add_argument("--val_batch_size", type=int, default=16, help="验证 batch size")
     parser.add_argument("--grad_accum", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--lr", type=float, default=5e-4, help="学习率")
-    parser.add_argument("--warmup_steps", type=int, default=200, help="warmup 步数 (与原脚本一致)")
+    parser.add_argument("--warmup_steps", type=int, default=100, help="warmup 步数")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay")
     parser.add_argument("--limit_train_size", type=int, default=0, help="限制训练 batch 数 (0=不限制)")
     
     # 混合精度
@@ -866,9 +1156,17 @@ def get_parser():
     parser.add_argument("--use_prefetch", action="store_true", default=False, help="使用 CUDA 数据预取 (可能略微影响数值精度)")
     parser.add_argument("--no_prefetch", dest="use_prefetch", action="store_false")
     
+    # INT8 QAT 参数
+    parser.add_argument("--qat_int8", action="store_true", default=False,
+                        help="启用 INT8 weight QAT (量化反量化 + STE 训练)")
+    parser.add_argument("--qat_weight_path", type=str, default="",
+                        help="QAT 模式下加载的预训练权重路径 (e.g., weights_40.tar)")
+    
     # 剪枝参数
     parser.add_argument("--pruning", type=int, default=1, help="是否启用剪枝 (0/1)")
     parser.add_argument("--sparsity", type=float, default=0.833333, help="目标稀疏度")
+    parser.add_argument("--last_linear_sparsity", type=float, default=None,
+                        help="最后一个 linear 层的稀疏率 (例如 0.75=4倍, 0=不剪枝, 默认跟随全局 sparsity)")
     parser.add_argument("--prune_log", type=str, default="./prune", help="剪枝日志路径")
     
     # 日志和检查点
