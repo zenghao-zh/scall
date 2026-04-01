@@ -97,8 +97,8 @@ class Prune:
                         )
                         self._initial_sparsity[name] = (
                             1
-                            - mask.cpu().numpy().astype(numpy.float32).sum()
-                            / weight.cpu().numpy().size
+                            - mask.cpu().float().numpy().sum()
+                            / weight.cpu().float().numpy().size
                         )
                         self._mask[name] = mask
                     else:
@@ -156,7 +156,7 @@ class Prune:
                         )
                         ####################################
                         keep_k = int(
-                            weight.cpu().numpy().size * (1.0 - current_sparsity)
+                            weight.numel() * (1.0 - current_sparsity)
                         )
                         # print('current_sparsity, name, weight.shape: ', current_sparsity, name, weight.cpu().numpy().shape)
                         ##########################################
@@ -186,10 +186,10 @@ class Prune:
                                 mask = prune_dim_4(weight=weight_, keep_k=keep_k, cgb=cgb, dtype=dtype_, group_size_value=self._group_size)
                             elif len(weight.shape) == 3:
                                 weight_ = weight.permute([2,1,0])  # ker, in, out
-                                weight_ = weight_.cpu().numpy()
+                                weight_ = weight_.cpu().float().numpy()
                                 mask = prune_dim_3(weight=weight_, keep_k_N=keep_k, cgb=cgb, dtype=dtype_, group_size_value=self._group_size)
                             elif len(weight.shape) == 2:
-                                weight_ = weight.cpu().numpy()
+                                weight_ = weight.cpu().float().numpy()
                                 mask = prune_dim_2(weight=weight_, keep_k=keep_k, dtype_=dtype_, cgb=cgb, group_size_value=self._group_size)
                             else:
                                 mask = update_mask(weight=weight, keep_k=keep_k)
@@ -204,7 +204,7 @@ class Prune:
         layer_sparse_rate = {}
         for name, parameter in self._model.named_parameters():
             if any(name == one for one in self._prune_dict):
-                temp = parameter.data.cpu().numpy()
+                temp = parameter.data.cpu().float().numpy()
                 total_param = total_param + temp.size
                 total_nonezero = total_nonezero + numpy.flatnonzero(temp).size
                 layer_sparse_rate[name] = 1 - numpy.flatnonzero(temp).size / temp.size

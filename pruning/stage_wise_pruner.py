@@ -228,7 +228,7 @@ class PrunerScheduler:
         layer_sparse_rate = {}
         for name, parameter in self.model.named_parameters():
             if any(name == one for one in prune_dict):
-                temp = parameter.data.cpu().numpy()
+                temp = parameter.data.cpu().float().numpy()
                 total_param = total_param + temp.size
                 total_nonezero = total_nonezero + np.flatnonzero(temp).size
                 layer_sparse_rate[name] = 1 - np.flatnonzero(temp).size / temp.size

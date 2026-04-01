@@ -5,6 +5,9 @@ opencall nn modules.
 import torch
 from torch.nn import Module
 from torch.nn.init import orthogonal_
+from load_moffett_ae import moffett_ae
+from .moffett_lstm import MoffettLSTM
+from .complied_lstm import CompiledLSTM
 
 
 layers = {}
@@ -152,7 +155,8 @@ class LinearCRFEncoder(Module):
     def forward(self, x):
         scores = self.linear(x)
         if self.activation is not None:
-            scores = self.activation(scores)
+            scores = moffett_ae.tanh(scores.to(torch.bfloat16))
+            scores = scores.to(x.dtype)
         if self.scale is not None:
             scores = scores * self.scale
         if self.blank_score is not None and self.expand_blanks:
@@ -282,7 +286,7 @@ class RNNWrapper(Module):
                 "'reverse' and 'bidirectional' should not both be set to True"
             )
         self.reverse = reverse
-        self.rnn = rnn_type(*args, bidirectional=bidirectional, **kwargs)
+        self.rnn = rnn_type(*args, **kwargs)
         self.init_orthogonal(orthogonal_weight_init)
         self.init_biases()
         if disable_state_bias:
@@ -323,6 +327,109 @@ class RNNWrapper(Module):
                 x.requires_grad = False
                 x.zero_()
 
+
+class ManualLSTMRNN(Module):
+    """Drop-in replacement for torch.nn.LSTM (single-layer, unidirectional).
+
+    Uses torch.mm / sigmoid / tanh which natively support bfloat16 on CUDA,
+    bypassing the _thnn_fused_lstm_cell kernel that does not support bf16.
+    Parameter names match torch.nn.LSTM so state_dict loads directly.
+    
+    Memory strategy: Uses gradient checkpointing to trade compute for memory.
+    This is essential because manual LSTM cannot match cuDNN's memory efficiency.
+    """
+
+    def __init__(self, input_size, hidden_size, bias=True, use_checkpointing=True, 
+                 checkpoint_segments=4, **kwargs):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.bias = bias
+        # Force checkpointing on to save memory
+        self.use_checkpointing = use_checkpointing if use_checkpointing is not None else True
+        # Divide sequence into N segments for chunked checkpointing
+        # Higher = less memory, more recomputation; Lower = more memory, less recomputation
+        self.checkpoint_segments = checkpoint_segments
+        self.weight_ih_l0 = torch.nn.Parameter(torch.empty(4 * hidden_size, input_size))
+        self.weight_hh_l0 = torch.nn.Parameter(torch.empty(4 * hidden_size, hidden_size))
+        if bias:
+            self.bias_ih_l0 = torch.nn.Parameter(torch.empty(4 * hidden_size))
+            self.bias_hh_l0 = torch.nn.Parameter(torch.empty(4 * hidden_size))
+        else:
+            self.register_parameter('bias_ih_l0', None)
+            self.register_parameter('bias_hh_l0', None)
+
+    @staticmethod
+    def _fake_quant_weight(w, num_bits=8):
+        """Per-tensor symmetric fake quantization for weight: quantize then dequantize."""
+        max_val = w.detach().abs().max()
+        qmax = 2 ** (num_bits - 1) - 1
+        scale = max_val / qmax
+        if scale == 0:
+            return w
+        w_q = torch.clamp(w / scale, -qmax, qmax)
+        w_q = torch.round(w_q)
+        return w_q * scale
+
+    @staticmethod
+    def _lstm_step(x_t, h, c, w_ih, w_hh, b_ih, b_hh):
+        """LSTM cell computation (static for checkpointing)."""
+        # Compute gates
+        gates = torch.mm(x_t, w_ih.t()) + torch.mm(h, w_hh.t())
+        if b_ih is not None:
+            gates = gates + b_ih + b_hh
+        
+        # Split and apply activations
+        H = h.size(1)
+        i = torch.sigmoid(gates[:, :H])
+        f = torch.sigmoid(gates[:, H:2*H])
+        g = torch.tanh(gates[:, 2*H:3*H])
+        o = torch.sigmoid(gates[:, 3*H:])
+        
+        # Update states
+        c_new = f * c + i * g
+        h_new = o * torch.tanh(c_new)
+        
+        return h_new, c_new
+
+    def forward(self, x, hx=None):
+        T, N, _ = x.shape
+        H = self.hidden_size
+        
+        # Initialize states
+        if hx is not None:
+            h = hx[0].squeeze(0)
+            c = hx[1].squeeze(0)
+        else:
+            h = torch.zeros(N, H, dtype=x.dtype, device=x.device)
+            c = torch.zeros(N, H, dtype=x.dtype, device=x.device)
+        
+        # Prepare weights
+        w_ih = self.weight_ih_l0
+        w_hh = self.weight_hh_l0
+        b_ih = self.bias_ih_l0 if self.bias else None
+        b_hh = self.bias_hh_l0 if self.bias else None
+        
+        # Pre-allocate output
+        outputs = x.new_empty(T, N, H)
+        
+        if self.use_checkpointing and self.training:
+            # Gradient checkpointing: recompute forward during backward
+            from torch.utils.checkpoint import checkpoint
+            for t in range(T):
+                h, c = checkpoint(
+                    self._lstm_step,
+                    x[t], h, c, w_ih, w_hh, b_ih, b_hh,
+                    use_reentrant=False
+                )
+                outputs[t] = h
+        else:
+            # Standard forward pass (eval or checkpointing disabled)
+            for t in range(T):
+                h, c = self._lstm_step(x[t], h, c, w_ih, w_hh, b_ih, b_hh)
+                outputs[t] = h
+        
+        return outputs, (h.unsqueeze(0), c.unsqueeze(0))
 
 @register
 class LSTM(RNNWrapper):

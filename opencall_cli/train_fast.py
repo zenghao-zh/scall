@@ -27,6 +27,7 @@ import time
 import argparse
 from datetime import timedelta
 from contextlib import nullcontext
+from collections import OrderedDict
 from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
@@ -48,7 +49,168 @@ from opencall.utils.util import (
     get_dataset_in_one_dir, get_dataset_from_pt, 
     get_lr_scheduler, log_func
 )
+from opencall.models.common.nn import LSTM, ManualLSTMRNN
 from pruning import PrunerScheduler
+import haste_pytorch as haste
+from MoffettLSTM.custom_lstm import FastLSTM
+
+
+def replace_lstm_with_manual(model, use_checkpointing=True, checkpoint_segments=4):
+    """Replace all torch.nn.LSTM inside LSTM (RNNWrapper) with ManualLSTMRNN.
+
+    Copies weights so the model produces identical results.
+    Must be called *before* converting to bfloat16.
+    
+    Args:
+        model: The model to modify
+        use_checkpointing: Enable gradient checkpointing to save memory (default: True)
+        checkpoint_segments: Divide sequence into N segments (higher = less memory, more recompute)
+    """
+    replaced = 0
+    for _name, module in model.named_modules():
+        if isinstance(module, LSTM) and isinstance(module.rnn, torch.nn.LSTM):
+            old = module.rnn
+            device = next(old.parameters()).device
+            dtype = next(old.parameters()).dtype
+            
+            manual = ManualLSTMRNN(
+                old.input_size, 
+                old.hidden_size, 
+                bias=old.bias,
+                use_checkpointing=use_checkpointing,
+                checkpoint_segments=checkpoint_segments
+            )
+            manual.load_state_dict(old.state_dict())
+            manual = manual.to(device=device, dtype=dtype)
+            
+            module.rnn = manual
+            replaced += 1
+    
+    if use_checkpointing:
+        print(f"[replace_lstm_with_manual] Replaced {replaced} torch.nn.LSTM → ManualLSTMRNN "
+              f"(checkpointing: {checkpoint_segments} segments)")
+    else:
+        print(f"[replace_lstm_with_manual] Replaced {replaced} torch.nn.LSTM → ManualLSTMRNN "
+              f"(checkpointing: disabled)")
+    return model
+
+
+class HasteLSTMWrapper(torch.nn.Module):
+    """Wrapper around haste.LSTM that handles AMP float16 → float32 conversion.
+
+    haste's CUDA kernel only supports float32. When AMP autocast is active,
+    inputs arrive as float16 — this wrapper casts to float32 before haste
+    and casts output back to the original dtype.
+    """
+    def __init__(self, haste_lstm):
+        super().__init__()
+        self.lstm = haste_lstm
+        self.input_size = haste_lstm.input_size
+        self.hidden_size = haste_lstm.hidden_size
+
+    @property
+    def kernel(self):
+        return self.lstm.kernel
+
+    @property
+    def recurrent_kernel(self):
+        return self.lstm.recurrent_kernel
+
+    @property
+    def bias(self):
+        return self.lstm.bias
+
+    def to_native_weights(self):
+        return self.lstm.to_native_weights()
+
+    def from_native_weights(self, *args, **kwargs):
+        return self.lstm.from_native_weights(*args, **kwargs)
+
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    def forward(self, x, hx=None):
+        x = x.float()
+        if hx is not None:
+            hx = (hx[0].float(), hx[1].float())
+            return self.lstm(x, state=hx)
+        return self.lstm(x)
+
+
+def replace_lstm_with_haste(model):
+    """Replace all torch.nn.LSTM inside LSTM (RNNWrapper) with haste.LSTM.
+
+    haste.LSTM uses fused CUDA kernels — fwd+bwd ~19% faster than cuDNN.
+    Weights are converted via from_native_weights() (handles gate reorder + transpose).
+    Wrapped with HasteLSTMWrapper for AMP compatibility (auto float16→float32 cast).
+
+    Constraints: CUDA only, fp32 weights (inputs auto-cast from fp16 under AMP).
+    """
+    replaced = 0
+    for _name, module in model.named_modules():
+        if isinstance(module, LSTM) and isinstance(module.rnn, torch.nn.LSTM):
+            old = module.rnn
+            h = haste.LSTM(old.input_size, old.hidden_size)
+            h.from_native_weights(
+                old.weight_ih_l0, old.weight_hh_l0,
+                old.bias_ih_l0, old.bias_hh_l0,
+            )
+            h = h.to(device=next(old.parameters()).device)
+            module.rnn = HasteLSTMWrapper(h)
+            replaced += 1
+    print(f"[replace_lstm_with_haste] Replaced {replaced} torch.nn.LSTM → haste.LSTM (AMP compatible)")
+    return model
+
+
+class FastLSTMWrapper(torch.nn.Module):
+    """Wrapper around FastLSTM that handles AMP and dtype conversion.
+
+    FastLSTM's moffett CUDA kernel only supports bfloat16. This wrapper
+    casts inputs to bfloat16 before FastLSTM and casts output back to
+    the original dtype, so it integrates seamlessly with AMP (float16)
+    and non-AMP (float32) training.
+    """
+    def __init__(self, fast_lstm):
+        super().__init__()
+        self.lstm = fast_lstm
+        self.input_size = fast_lstm.input_size
+        self.hidden_size = fast_lstm.hidden_size
+
+    def forward(self, x, hx=None):
+        orig_dtype = x.dtype
+        with torch.cuda.amp.autocast(enabled=False):
+            x = x.to(torch.bfloat16)
+            if hx is not None:
+                hx = (hx[0].to(torch.bfloat16), hx[1].to(torch.bfloat16))
+            out, hidden = self.lstm(x, hx)
+        return out.to(orig_dtype), hidden
+
+
+def replace_lstm_with_fast(model):
+    """Replace all torch.nn.LSTM inside LSTM (RNNWrapper) with FastLSTM.
+
+    FastLSTM uses custom CUDA kernels with moffett sigmoid/tanh approximation.
+    Runs in bfloat16 for both forward and backward.
+    Wrapped with FastLSTMWrapper for AMP compatibility (auto dtype conversion).
+
+    Constraints: CUDA only, bfloat16 weights and inputs.
+    """
+    replaced = 0
+    for _name, module in model.named_modules():
+        if isinstance(module, LSTM) and isinstance(module.rnn, torch.nn.LSTM):
+            old = module.rnn
+            device = next(old.parameters()).device
+            fast = FastLSTM(
+                old.input_size, old.hidden_size,
+                num_layers=1, bias=old.bias,
+                batch_first=False,
+                activation_impl="moffett",
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            fast.load_state_dict({k: v.to(torch.bfloat16) for k, v in old.state_dict().items()})
+            module.rnn = FastLSTMWrapper(fast)
+            replaced += 1
+    print(f"[replace_lstm_with_fast] Replaced {replaced} torch.nn.LSTM → FastLSTM (moffett, bf16)")
+    return model
 
 
 # ============================================================================
@@ -339,6 +501,24 @@ class Trainer:
                 torch.load(self.args.pre_trained_params_file, map_location=f'cuda:{self.local_rank}')
             )
         
+        # 替换 LSTM 实现 (互斥选项，haste 优先)
+        if self.args.use_haste_lstm:
+            if self.is_main_process:
+                print("[Replacing torch.nn.LSTM with haste.LSTM (fused CUDA kernel)]")
+            self.model_orig = replace_lstm_with_haste(self.model_orig)
+        elif self.args.use_fast_lstm:
+            if self.is_main_process:
+                print("[Replacing torch.nn.LSTM with FastLSTM (moffett CUDA kernel, bf16)]")
+            self.model_orig = replace_lstm_with_fast(self.model_orig)
+        elif self.args.use_manual_lstm:
+            if self.is_main_process:
+                print("[Replacing torch.nn.LSTM with ManualLSTMRNN]")
+            self.model_orig = replace_lstm_with_manual(
+                self.model_orig, 
+                use_checkpointing=self.args.lstm_checkpointing,
+                checkpoint_segments=self.args.lstm_segments
+            )
+        
         # torch.compile 加速 (PyTorch 2.0+)
         if self.args.compile and hasattr(torch, 'compile'):
             if self.is_main_process:
@@ -361,6 +541,90 @@ class Trainer:
             trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             self._log(f"Total parameters: {total_params:,}")
             self._log(f"Trainable parameters: {trainable_params:,}")
+            
+            # 打印模型结构
+            if self.args.print_model:
+                self._print_model_structure()
+    
+    def _print_model_structure(self):
+        """打印模型结构信息"""
+        if not self.is_main_process:
+            return
+        
+        print("\n" + "=" * 80)
+        print("MODEL STRUCTURE")
+        print("=" * 80)
+        
+        # 打印模型架构
+        print("\n[Model Architecture]")
+        print(self.model_orig)
+        
+        # 统计不同类型的模块
+        print("\n[Module Statistics]")
+        module_counts = {}
+        for name, module in self.model_orig.named_modules():
+            module_type = type(module).__name__
+            if module_type not in module_counts:
+                module_counts[module_type] = 0
+            module_counts[module_type] += 1
+        
+        for module_type, count in sorted(module_counts.items()):
+            print(f"  {module_type}: {count}")
+        
+        # 详细列出关键层的信息
+        print("\n[Key Layers Details]")
+        from opencall.models.common.nn import LSTM as LSTM_Module, ManualLSTMRNN
+        
+        lstm_layers = []
+        for name, module in self.model_orig.named_modules():
+            if isinstance(module, LSTM_Module):
+                rnn_type = type(module.rnn).__name__
+                lstm_layers.append((name, rnn_type, module.rnn))
+        
+        if lstm_layers:
+            print(f"\n  Found {len(lstm_layers)} LSTM layers:")
+            for name, rnn_type, rnn in lstm_layers:
+                print(f"    - {name}")
+                print(f"      Type: {rnn_type}")
+                print(f"      Input size: {rnn.input_size}")
+                print(f"      Hidden size: {rnn.hidden_size}")
+                if isinstance(rnn, ManualLSTMRNN):
+                    ckpt_status = "✓" if rnn.use_checkpointing else "✗"
+                    print(f"      ✓ Using ManualLSTMRNN (bfloat16 compatible)")
+                    print(f"      {ckpt_status} Gradient checkpointing: {rnn.use_checkpointing}")
+                elif isinstance(rnn, HasteLSTMWrapper):
+                    print(f"      ✓ Using haste.LSTM (fused CUDA fwd+bwd, AMP compatible)")
+                elif isinstance(rnn, FastLSTMWrapper):
+                    print(f"      ✓ Using FastLSTM (moffett CUDA kernel, bf16 fwd+bwd)")
+                else:
+                    print(f"      Using torch.nn.LSTM")
+        
+        # 打印参数详情
+        print("\n[Parameters Details]")
+        total_params = 0
+        trainable_params = 0
+        for name, param in self.model_orig.named_parameters():
+            total_params += param.numel()
+            if param.requires_grad:
+                trainable_params += param.numel()
+        
+        print(f"  Total parameters: {total_params:,}")
+        print(f"  Trainable parameters: {trainable_params:,}")
+        print(f"  Non-trainable parameters: {total_params - trainable_params:,}")
+        
+        # 打印每层参数数量（仅主要层）
+        print("\n[Layer Parameters]")
+        layer_params = {}
+        for name, param in self.model_orig.named_parameters():
+            layer_name = name.split('.')[0]
+            if layer_name not in layer_params:
+                layer_params[layer_name] = 0
+            layer_params[layer_name] += param.numel()
+        
+        for layer_name, num_params in sorted(layer_params.items(), key=lambda x: -x[1]):
+            print(f"  {layer_name}: {num_params:,}")
+        
+        print("\n" + "=" * 80 + "\n")
     
     def _setup_optimizer(self):
         """初始化优化器和学习率调度器"""
@@ -388,8 +652,9 @@ class Trainer:
                   f"lr={self.args.lr}, end_ratio=0.01, "
                   f"warmup={self.args.warmup_steps}, total_steps={total_steps}")
         
-        # 混合精度训练
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.args.use_amp)
+        # 混合精度训练: bf16 与 fp32 指数范围相同，不需要 GradScaler
+        use_scaler = self.args.use_amp and not self.args.use_fast_lstm
+        self.scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
     
     def _setup_pruner(self):
         """初始化剪枝器"""
@@ -579,18 +844,27 @@ class Trainer:
         self._qat_hooks = []
         for name, module, mtype in qat_targets:
             if mtype == 'lstm':
-                def lstm_pre_hook(mod, inputs, module_name=name):
-                    # 备份原始 FP32 权重
-                    mod._qat_saved_weight_ih = mod.rnn.weight_ih_l0.data.clone()
-                    mod._qat_saved_weight_hh = mod.rnn.weight_hh_l0.data.clone()
-                    # 替换为 INT8 量化值 (detached, 用于 forward 计算)
-                    mod.rnn.weight_ih_l0.data = fake_quantize_int8_detached(mod.rnn.weight_ih_l0.data)
-                    mod.rnn.weight_hh_l0.data = fake_quantize_int8_detached(mod.rnn.weight_hh_l0.data)
-                def lstm_post_hook(mod, inputs, outputs, module_name=name):
-                    # 恢复原始 FP32 权重, 使 backward 梯度作用在原始权重上
-                    mod.rnn.weight_ih_l0.data = mod._qat_saved_weight_ih
-                    mod.rnn.weight_hh_l0.data = mod._qat_saved_weight_hh
-                    del mod._qat_saved_weight_ih, mod._qat_saved_weight_hh
+                is_haste = isinstance(module.rnn, HasteLSTMWrapper)
+                if is_haste:
+                    def lstm_pre_hook(mod, inputs, module_name=name):
+                        mod._qat_saved_kernel = mod.rnn.kernel.data.clone()
+                        mod._qat_saved_recurrent_kernel = mod.rnn.recurrent_kernel.data.clone()
+                        mod.rnn.lstm.kernel.data = fake_quantize_int8_detached(mod.rnn.kernel.data)
+                        mod.rnn.lstm.recurrent_kernel.data = fake_quantize_int8_detached(mod.rnn.recurrent_kernel.data)
+                    def lstm_post_hook(mod, inputs, outputs, module_name=name):
+                        mod.rnn.lstm.kernel.data = mod._qat_saved_kernel
+                        mod.rnn.lstm.recurrent_kernel.data = mod._qat_saved_recurrent_kernel
+                        del mod._qat_saved_kernel, mod._qat_saved_recurrent_kernel
+                else:
+                    def lstm_pre_hook(mod, inputs, module_name=name):
+                        mod._qat_saved_weight_ih = mod.rnn.weight_ih_l0.data.clone()
+                        mod._qat_saved_weight_hh = mod.rnn.weight_hh_l0.data.clone()
+                        mod.rnn.weight_ih_l0.data = fake_quantize_int8_detached(mod.rnn.weight_ih_l0.data)
+                        mod.rnn.weight_hh_l0.data = fake_quantize_int8_detached(mod.rnn.weight_hh_l0.data)
+                    def lstm_post_hook(mod, inputs, outputs, module_name=name):
+                        mod.rnn.weight_ih_l0.data = mod._qat_saved_weight_ih
+                        mod.rnn.weight_hh_l0.data = mod._qat_saved_weight_hh
+                        del mod._qat_saved_weight_ih, mod._qat_saved_weight_hh
                 self._qat_hooks.append(module.register_forward_pre_hook(lstm_pre_hook))
                 self._qat_hooks.append(module.register_forward_hook(lstm_post_hook))
             elif mtype == 'linear_crf':
@@ -735,7 +1009,8 @@ class Trainer:
             if self.is_main_process:
                 self._log("[Initial Validation] Before training starts")
                 print("[DEBUG] Starting initial validation...")
-                self._validate_only()
+                with torch.no_grad():
+                    self._validate_only()
                 print("[DEBUG] Initial validation done, waiting for barrier...")
             # 同步等待主进程完成初始验证
             dist.barrier()
@@ -848,8 +1123,9 @@ class Trainer:
         if batch_idx % grad_accum == 0:
             self.optimizer.zero_grad()
         
-        # 混合精度上下文
-        autocast_ctx = torch.cuda.amp.autocast(enabled=self.args.use_amp)
+        # 混合精度上下文: FastLSTM 需要 bf16 autocast，其余用默认 fp16
+        amp_dtype = torch.bfloat16 if self.args.use_fast_lstm else torch.float16
+        autocast_ctx = torch.cuda.amp.autocast(enabled=self.args.use_amp, dtype=amp_dtype)
         
         # 梯度同步上下文 (累积时禁用同步以提高效率)
         if is_accumulating:
@@ -933,6 +1209,70 @@ class Trainer:
         self._log(msg)
         print(msg)
     
+    def _convert_haste_to_native_state_dict(self, state_dict):
+        """Convert haste LSTM parameters back to native torch.nn.LSTM format.
+
+        haste.LSTM stores weights as (kernel, recurrent_kernel, bias) with
+        gate order [i,g,f,o] and shape [in, 4H]. torch.nn.LSTM uses
+        (weight_ih_l0, weight_hh_l0, bias_ih_l0, bias_hh_l0) with gate
+        order [i,f,g,o] and shape [4H, in].
+
+        Key ordering must match the native model's state_dict (module
+        registration order) so that match_names() pairs same-shape tensors
+        correctly.
+        """
+        if not self.args.use_haste_lstm:
+            return state_dict
+
+        def reorder_igfo_to_ifgo(w):
+            i, g, f, o = torch.chunk(w, 4, dim=-1)
+            return torch.cat([i, f, g, o], dim=-1)
+
+        native = OrderedDict()
+        consumed = set()
+        for key in state_dict:
+            if key in consumed:
+                continue
+            if key.endswith('.rnn.lstm.kernel'):
+                prefix = key[:-len('.rnn.lstm.kernel')]
+                k_recurrent = f"{prefix}.rnn.lstm.recurrent_kernel"
+                k_bias = f"{prefix}.rnn.lstm.bias"
+                consumed.update([k_recurrent, k_bias])
+
+                kernel = reorder_igfo_to_ifgo(state_dict[key]).permute(1, 0).contiguous()
+                recurrent_kernel = reorder_igfo_to_ifgo(state_dict[k_recurrent]).permute(1, 0).contiguous()
+                half_bias = reorder_igfo_to_ifgo(state_dict[k_bias]) / 2.0
+
+                native[f"{prefix}.rnn.weight_ih_l0"] = kernel
+                native[f"{prefix}.rnn.weight_hh_l0"] = recurrent_kernel
+                native[f"{prefix}.rnn.bias_ih_l0"] = half_bias.clone()
+                native[f"{prefix}.rnn.bias_hh_l0"] = half_bias.clone()
+            else:
+                native[key] = state_dict[key]
+
+        return native
+
+    def _convert_fast_to_native_state_dict(self, state_dict):
+        """Convert FastLSTM (wrapped) parameters back to native torch.nn.LSTM format.
+
+        FastLSTMWrapper stores the FastLSTM as self.lstm, so state_dict keys
+        contain an extra '.lstm.' segment, e.g.:
+            encoder.4.rnn.lstm.weight_ih_l0 → encoder.4.rnn.weight_ih_l0
+
+        Also converts bfloat16 weights to float32 for deployment compatibility.
+        """
+        if not self.args.use_fast_lstm:
+            return state_dict
+
+        native = OrderedDict()
+        for key, value in state_dict.items():
+            if '.rnn.lstm.' in key:
+                new_key = key.replace('.rnn.lstm.', '.rnn.')
+                native[new_key] = value.float()
+            else:
+                native[key] = value
+        return native
+
     def _quantize_state_dict(self, state_dict):
         """对 state_dict 中 QAT 目标层的 weight 做 INT8 量化反量化.
         
@@ -951,11 +1291,13 @@ class Trainer:
         
         quantized = {}
         for key, value in state_dict.items():
-            # LSTM weights
+            # nn.LSTM / ManualLSTMRNN weights
             if 'rnn.weight_ih_l0' in key or 'rnn.weight_hh_l0' in key:
                 quantized[key] = fake_quantize_int8_detached(value)
+            # haste.LSTM weights (through HasteLSTMWrapper: rnn.lstm.kernel)
+            elif 'lstm.kernel' in key or 'lstm.recurrent_kernel' in key:
+                quantized[key] = fake_quantize_int8_detached(value)
             # LinearCRFEncoder's linear.weight
-            # 在 rnn_encoder 架构中, 只有 LinearCRFEncoder 有 linear.weight 结尾的 key
             elif key.endswith('linear.weight'):
                 quantized[key] = fake_quantize_int8_detached(value)
             else:
@@ -970,26 +1312,33 @@ class Trainer:
         if not self.is_main_process:
             return
         
-        weights_path = os.path.join(self.res_dir, "weights_init.tar")
-        model_state = self._quantize_state_dict(self.model.module.state_dict())
-        torch.save(model_state, weights_path)
-        
-        res = model_eval(
-            dataloader=self.valid_loader,
-            model_dir=self.res_dir,
-            weight_path=weights_path,
-            is_half=True,
-            device=self.local_rank,
-        )
+        if self.args.use_haste_lstm or self.args.use_fast_lstm:
+            self.model.module.eval()
+            res = model_eval(
+                dataloader=self.valid_loader,
+                is_half=False,
+                device=self.local_rank,
+                model=self.model.module,
+            )
+            self.model.module.train()
+        else:
+            weights_path = os.path.join(self.res_dir, "weights_init.tar")
+            model_state = self._quantize_state_dict(self.model.module.state_dict())
+            torch.save(model_state, weights_path)
+            res = model_eval(
+                dataloader=self.valid_loader,
+                model_dir=self.res_dir,
+                weight_path=weights_path,
+                is_half=True,
+                device=self.local_rank,
+            )
+            if os.path.exists(weights_path):
+                os.remove(weights_path)
         
         mean_acc, median_acc, duration, speed_samples, speed_bases, chunks_num = res
         self._log(f"  Mean accuracy:    {mean_acc:.2f}%")
         self._log(f"  Median accuracy:  {median_acc:.2f}%")
         self._log(f"  Validation time:  {duration:.2f}s")
-        
-        # 清理临时文件
-        if os.path.exists(weights_path):
-            os.remove(weights_path)
     
     def _validate_and_save(self):
         """验证并保存模型
@@ -1001,21 +1350,35 @@ class Trainer:
         if not self.is_main_process:
             return
         
-        # 保存模型权重 (QAT 模式下对目标权重做 INT8 量化反量化)
-        model_state = self._quantize_state_dict(self.model.module.state_dict())
+        # 保存模型权重
+        raw_state = self.model.module.state_dict()
+        # eval 权重: 转换为 native 格式 (fp32, nn.LSTM 键名), 部署兼容
+        eval_state = self._quantize_state_dict(dict(raw_state))
+        eval_state = self._convert_haste_to_native_state_dict(eval_state)
+        eval_state = self._convert_fast_to_native_state_dict(eval_state)
         weights_path = os.path.join(self.res_dir, f"weights_{self.epoch}.tar")
-        torch.save(model_state, weights_path)
+        torch.save(eval_state, weights_path)
         
         # 执行验证
         self._log(f"[Validation] Epoch {self.epoch}")
         
-        res = model_eval(
-            dataloader=self.valid_loader,
-            model_dir=self.res_dir,
-            weight_path=weights_path,
-            is_half=True,
-            device=self.local_rank,
-        )
+        if self.args.use_haste_lstm or self.args.use_fast_lstm:
+            self.model.module.eval()
+            res = model_eval(
+                dataloader=self.valid_loader,
+                is_half=False,
+                device=self.local_rank,
+                model=self.model.module,
+            )
+            self.model.module.train()
+        else:
+            res = model_eval(
+                dataloader=self.valid_loader,
+                model_dir=self.res_dir,
+                weight_path=weights_path,
+                is_half=True,
+                device=self.local_rank,
+            )
         
         mean_acc, median_acc, duration, speed_samples, speed_bases, chunks_num = res
         
@@ -1035,12 +1398,13 @@ class Trainer:
             self.best_metric = mean_acc
             self._log(f"  [NEW BEST] Accuracy improved to {mean_acc:.2f}%")
         
-        # 保存检查点
+        # 保存检查点 (使用原始 state_dict, 保留 wrapper 键名, 确保 resume 兼容)
+        ckpt_state = self._quantize_state_dict(dict(raw_state))
         state = {
             'epoch': self.epoch + 1,
             'global_step': self.global_step,
             'best_metric': self.best_metric,
-            'model_state_dict': model_state,
+            'model_state_dict': ckpt_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
             'args': vars(self.args),
@@ -1094,13 +1458,19 @@ class Trainer:
         best_weights_path = os.path.join(self.res_dir, "weights_best.tar")
         
         if best_ckpt:
-            self.model.module.load_state_dict(best_ckpt['model_state_dict'])
-            best_state = self._quantize_state_dict(best_ckpt['model_state_dict'])
+            ckpt_state = best_ckpt['model_state_dict']
+            self.model.module.load_state_dict(ckpt_state)
+            # 转换为 native 格式用于 eval (部署兼容)
+            best_state = self._quantize_state_dict(dict(ckpt_state))
+            best_state = self._convert_haste_to_native_state_dict(best_state)
+            best_state = self._convert_fast_to_native_state_dict(best_state)
             torch.save(best_state, best_weights_path)
             self._log("[Final Evaluation] Using best model")
         else:
             # 没有最佳检查点，使用最后的模型
             last_state = self._quantize_state_dict(self.model.module.state_dict())
+            last_state = self._convert_haste_to_native_state_dict(last_state)
+            last_state = self._convert_fast_to_native_state_dict(last_state)
             torch.save(last_state, best_weights_path)
             self._log("[Final Evaluation] Using last model (no best checkpoint)")
         
@@ -1134,6 +1504,20 @@ def get_parser():
     parser.add_argument("--model", type=str, default="lstm_ctc_crf", help="模型类型")
     parser.add_argument("--pre_trained_params_file", type=str, default="", help="预训练模型路径")
     parser.add_argument("--compile", action="store_true", help="使用 torch.compile 加速 (PyTorch 2.0+)")
+    parser.add_argument("--use_haste_lstm", action="store_true", default=False,
+                        help="使用 haste.LSTM 替换 torch.nn.LSTM (fused CUDA fwd+bwd, fp32 only, 训练快 ~19%%)")
+    parser.add_argument("--use_fast_lstm", action="store_true", default=False,
+                        help="使用 FastLSTM (MoffettLSTM) 替换 torch.nn.LSTM (moffett CUDA kernel, bf16 fwd+bwd)")
+    parser.add_argument("--use_manual_lstm", action="store_true", default=False,
+                        help="使用 ManualLSTMRNN 替换 torch.nn.LSTM (支持 bfloat16)")
+    parser.add_argument("--lstm_checkpointing", action="store_true", default=True,
+                        help="在 ManualLSTMRNN 中启用梯度检查点 (默认启用以节省显存)")
+    parser.add_argument("--no_lstm_checkpointing", dest="lstm_checkpointing", action="store_false",
+                        help="禁用 LSTM 梯度检查点")
+    parser.add_argument("--lstm_segments", type=int, default=4,
+                        help="LSTM 分块数量 (越大越省显存但越慢，建议 2-8，默认 4)")
+    parser.add_argument("--print_model", action="store_true", default=False,
+                        help="打印详细的模型结构信息")
     
     # 训练参数
     parser.add_argument("--epoch_num", type=int, default=1, help="训练轮数")

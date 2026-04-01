@@ -25,6 +25,14 @@ try:
 except ImportError:
     pass
 
+# Import FastLSTM for optimized LSTM inference
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
+    from MoffettLSTM.custom_lstm import FastLSTM
+    FASTLSTM_AVAILABLE = True
+except ImportError:
+    FASTLSTM_AVAILABLE = False
+
 
 __dir__ = os.path.dirname(os.path.realpath(__file__))
 __data__ = os.path.join(__dir__, "data")
@@ -367,14 +375,72 @@ def replace_lstm_with_manual(model):
     return model
 
 
+class FastLSTMWrapper(torch.nn.Module):
+    """Wrapper around FastLSTM that handles AMP and dtype conversion.
+
+    FastLSTM's moffett CUDA kernel only supports bfloat16. This wrapper
+    casts inputs to bfloat16 before FastLSTM and casts output back to
+    the original dtype, so it integrates seamlessly with AMP (float16)
+    and non-AMP (float32) training.
+    """
+    def __init__(self, fast_lstm):
+        super().__init__()
+        self.lstm = fast_lstm
+        self.input_size = fast_lstm.input_size
+        self.hidden_size = fast_lstm.hidden_size
+
+    def forward(self, x, hx=None):
+        orig_dtype = x.dtype
+        with torch.cuda.amp.autocast(enabled=False):
+            x = x.to(torch.bfloat16)
+            if hx is not None:
+                hx = (hx[0].to(torch.bfloat16), hx[1].to(torch.bfloat16))
+            out, hidden = self.lstm(x, hx)
+        return out.to(orig_dtype), hidden
+
+
+def replace_lstm_with_fast(model):
+    """Replace all torch.nn.LSTM inside LSTM (RNNWrapper) with FastLSTM.
+
+    FastLSTM uses custom CUDA kernels with moffett sigmoid/tanh approximation.
+    Runs in bfloat16 for both forward and backward.
+    Wrapped with FastLSTMWrapper for AMP compatibility (auto dtype conversion).
+
+    Constraints: CUDA only, bfloat16 weights and inputs.
+    """
+    if not FASTLSTM_AVAILABLE:
+        print("[WARNING] FastLSTM not available, falling back to ManualLSTMRNN")
+        return replace_lstm_with_manual(model)
+    
+    from cyclonebasecall.models.common.nn import LSTM
+    replaced = 0
+    for _name, module in model.named_modules():
+        if isinstance(module, LSTM) and isinstance(module.rnn, torch.nn.LSTM):
+            old = module.rnn
+            device = next(old.parameters()).device
+            fast = FastLSTM(
+                old.input_size, old.hidden_size,
+                num_layers=1, bias=old.bias,
+                batch_first=False,
+                activation_impl="moffett",
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            fast.load_state_dict({k: v.to(torch.bfloat16) for k, v in old.state_dict().items()})
+            module.rnn = FastLSTMWrapper(fast)
+            replaced += 1
+    print(f"[replace_lstm_with_fast] Replaced {replaced} torch.nn.LSTM → FastLSTM (moffett, bf16)")
+    return model
+
+
 def load_quant_model(dirname, device, io_quant_path, act_scales_path, half=None, bf16=False, bitwidth=8):
     """
     Load a model with FakeQuant layers inserted, using quantized weights.
 
     Args:
         half: convert to float16.
-        bf16: convert to bfloat16 (replaces torch.nn.LSTM with ManualLSTMRNN
-              first, since CUDA LSTM kernel doesn't support bf16).
+        bf16: convert to bfloat16 (replaces torch.nn.LSTM with FastLSTM on CUDA,
+              or ManualLSTMRNN on CPU, since CUDA LSTM kernel doesn't support bf16).
     """
     if not os.path.isdir(dirname) and os.path.isdir(os.path.join(__models__, dirname)):
         dirname = os.path.join(__models__, dirname)
@@ -394,7 +460,10 @@ def load_quant_model(dirname, device, io_quant_path, act_scales_path, half=None,
     model.load_state_dict(state_dict)
 
     if bf16:
-        replace_lstm_with_manual(model)
+        if torch.cuda.is_available() and FASTLSTM_AVAILABLE:
+            replace_lstm_with_fast(model)
+        else:
+            replace_lstm_with_manual(model)
         model = model.bfloat16()
         print(f"[load_quant_model] Model converted to bfloat16, dtype={next(model.parameters()).dtype}")
     elif half is None:

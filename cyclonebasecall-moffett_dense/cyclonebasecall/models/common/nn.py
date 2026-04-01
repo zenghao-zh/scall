@@ -5,6 +5,7 @@ opencall nn modules.
 import torch
 from torch.nn import Module
 from torch.nn.init import orthogonal_
+from load_moffett_ae import moffett_ae
 
 
 layers = {}
@@ -134,7 +135,8 @@ class LinearCRFEncoder(Module):
     def forward(self, x):
         scores = self.linear(x)
         if self.activation is not None:
-            scores = self.activation(scores)
+            scores = moffett_ae.tanh(scores.to(torch.bfloat16))
+            scores = scores.to(x.dtype)
         if self.scale is not None:
             scores = scores * self.scale
         if self.blank_score is not None and self.expand_blanks:

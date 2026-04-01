@@ -39,6 +39,9 @@ from sklearn import utils
 import numpy as np
 import parasail
 
+from load_moffett_ae import moffett_ae
+from MoffettLSTM.custom_lstm import FastLSTM
+
 pro_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, pro_dir)
 
@@ -219,9 +222,9 @@ class ManualLSTMRNN(Module):
             if b is not None:
                 gates = gates + b
             i, f, g, o = gates.chunk(4, dim=1)
-            i, f, g, o = torch.sigmoid(i), torch.sigmoid(f), torch.tanh(g), torch.sigmoid(o)
+            i, f, g, o = moffett_ae.sigmoid(i), moffett_ae.sigmoid(f), moffett_ae.tanh(g), moffett_ae.sigmoid(o)
             c = f * c + i * g
-            h = o * torch.tanh(c)
+            h = o * moffett_ae.tanh(c)
             outputs.append(h)
         return torch.stack(outputs, dim=0), (h.unsqueeze(0), c.unsqueeze(0))
 
@@ -244,6 +247,59 @@ def replace_lstm_with_manual(model):
     return model
 
 
+class FastLSTMWrapper(Module):
+    """Wrapper around FastLSTM that handles AMP and dtype conversion.
+
+    FastLSTM's moffett CUDA kernel only supports bfloat16. This wrapper
+    casts inputs to bfloat16 before FastLSTM and casts output back to
+    the original dtype, so it integrates seamlessly with AMP (float16)
+    and non-AMP (float32) training.
+    """
+    def __init__(self, fast_lstm):
+        super().__init__()
+        self.lstm = fast_lstm
+        self.input_size = fast_lstm.input_size
+        self.hidden_size = fast_lstm.hidden_size
+
+    def forward(self, x, hx=None):
+        orig_dtype = x.dtype
+        with torch.cuda.amp.autocast(enabled=False):
+            x = x.to(torch.bfloat16)
+            if hx is not None:
+                hx = (hx[0].to(torch.bfloat16), hx[1].to(torch.bfloat16))
+            out, hidden = self.lstm(x, hx)
+        return out.to(orig_dtype), hidden
+
+
+def replace_lstm_with_fast(model):
+    """Replace all torch.nn.LSTM inside LSTM (RNNWrapper) with FastLSTM.
+
+    FastLSTM uses custom CUDA kernels with moffett sigmoid/tanh approximation.
+    Runs in bfloat16 for both forward and backward.
+    Wrapped with FastLSTMWrapper for AMP compatibility (auto dtype conversion).
+
+    Constraints: CUDA only, bfloat16 weights and inputs.
+    """
+    replaced = 0
+    for _name, module in model.named_modules():
+        if isinstance(module, LSTM) and isinstance(module.rnn, torch.nn.LSTM):
+            old = module.rnn
+            device = next(old.parameters()).device
+            fast = FastLSTM(
+                old.input_size, old.hidden_size,
+                num_layers=1, bias=old.bias,
+                batch_first=False,
+                activation_impl="moffett",
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            fast.load_state_dict({k: v.to(torch.bfloat16) for k, v in old.state_dict().items()})
+            module.rnn = FastLSTMWrapper(fast)
+            replaced += 1
+    print(f"[replace_lstm_with_fast] Replaced {replaced} torch.nn.LSTM → FastLSTM (moffett, bf16)")
+    return model
+
+
 @register
 class LinearCRFEncoder(Module):
     def __init__(self, insize, n_base, state_len, bias=True, scale=None,
@@ -262,7 +318,8 @@ class LinearCRFEncoder(Module):
     def forward(self, x):
         scores = self.linear(x)
         if self.activation is not None:
-            scores = self.activation(scores)
+            scores = moffett_ae.tanh(scores.to(torch.bfloat16))
+            scores = scores.to(x.dtype)
         if self.scale is not None:
             scores = scores * self.scale
         if self.blank_score is not None and self.expand_blanks:
@@ -801,8 +858,8 @@ def load_quant_model(config, io_quant_path, act_scales_path, device,
 
     Args:
         half: convert to float16.
-        bf16:  convert to bfloat16 (replaces torch.nn.LSTM with ManualLSTMRNN
-               first, since CUDA LSTM kernel doesn't support bf16).
+        bf16:  convert to bfloat16 (replaces torch.nn.LSTM with FastLSTM on CUDA,
+               or ManualLSTMRNN on CPU, since CUDA LSTM kernel doesn't support bf16).
     """
     device = torch.device(device)
     model = Model(config)
@@ -817,7 +874,10 @@ def load_quant_model(config, io_quant_path, act_scales_path, device,
     model.load_state_dict(state_dict)
 
     if bf16:
-        replace_lstm_with_manual(model)
+        if torch.cuda.is_available():
+            replace_lstm_with_fast(model)
+        else:
+            replace_lstm_with_manual(model)
         model = model.bfloat16()
     elif half:
         model = model.half()
@@ -948,7 +1008,6 @@ def model_eval(dataloader, model, is_half, device, use_koi=False,
             )
             seqs.extend(decoded)
 
-            break
 
             # save_dict = {
             #     "backbone_output": x.cpu(),
@@ -1042,8 +1101,8 @@ def main():
 
     MODEL_DIR = args.model_dir
     CONFIG_PATH = os.path.join(MODEL_DIR, "config.toml")
-    IO_QUANT_PATH = "/workspace/huada/scall/caoyu/layer_9_6x_io_quant_0305.pth"
-    ACT_SCALES_PATH = "/workspace/huada/scall/caoyu/layer_9_6x_act_scales_0305.pth"
+    IO_QUANT_PATH = "/workspace/huada/task_results/lstm_ctc_crf_finetune_moffett_fast/io_quant_0318.pth"
+    ACT_SCALES_PATH = "/workspace/huada/task_results/lstm_ctc_crf_finetune_moffett_fast/act_scales_0318.pth"
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)

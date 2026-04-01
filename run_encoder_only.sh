@@ -65,16 +65,23 @@ size 128     --lr 0.0004     --epoch_num 20     --model lstm_ctc_crf     --outpu
 rf_optimized_l9_6x_0214     --num_workers 2     --log_interval 10 --val_before_train --resume
 
 
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" torchrun --nproc_per_node=8 /workspace/huada/scall/opencall_cli/train_fast.py \
+CUDA_VISIBLE_DEVICES="4,5,6,7" torchrun --nproc_per_node=4 /workspace/huada/scall/opencall_cli/train_fast.py \
     --data_dir /workspace/huada/moffett_data/250F600274011_train_data/train_mmap \
     --data_type pt \
     --batch_size 128 \
     --lr 0.0001 \
     --epoch_num 10 \
-    --model lstm_ctc_crf \
-    --output_name lstm_ctc_crf_qat_int8 \
+    --model lstm_ctc_crf_moffett \
+    --output_name lstm_ctc_crf_finetune_moffett \
     --num_workers 2 \
     --log_interval 10 \
-    --qat_int8 \
-    --qat_weight_path /workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/weights_40.tar \
-    --resume
+    --pre_trained_params_file /workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/weights_40.tar
+
+
+
+python /workspace/huada/scall/viterbi_0224.py \
+    --model_dir /workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214 \
+    --data_dir /workspace/huada/moffett_data/250F600274011_train_data/val \
+    --device cuda:0 \
+    --val_batch_size 64 \
+    --seed 25

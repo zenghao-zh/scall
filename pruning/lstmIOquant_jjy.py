@@ -14,6 +14,7 @@ from opencall.utils.util import (
     decode_ref,
     permute,
 )
+from opencall_cli.train_fast import replace_lstm_with_fast
 
 
 def validate_one_step(batch, model, device, min_coverage=0.5):
@@ -105,11 +106,11 @@ def hook_model(model, act_scales):
 
 @torch.no_grad()
 def main():
-    config_file = '/workspace/huada/task_results/lstm_ctc_crf_qat_int8/config.toml'
-    pretrained_model_file = '/workspace/huada/task_results/lstm_ctc_crf_qat_int8/weights_8.tar'
-    act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_qat_int8/act_scales_8.pth'
-    io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_qat_int8/io_quant_8.pth'
-    new_io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_qat_int8/io_quant_wo0_8.pth'
+    config_file = '/workspace/huada/task_results/lstm_ctc_crf_finetune_moffett_fast/config.toml'
+    pretrained_model_file = '/workspace/huada/task_results/lstm_ctc_crf_finetune_moffett_fast/weights_0.tar'
+    act_scales_path = '/workspace/huada/task_results/lstm_ctc_crf_finetune_moffett_fast/act_scales_0318.pth'
+    io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_finetune_moffett_fast/io_quant_0318.pth'
+    new_io_quant_path = '/workspace/huada/task_results/lstm_ctc_crf_finetune_moffett_fast/io_quant_wo0_0318.pth'
 
     # config_file = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/config.toml'
     # pretrained_model_file = '/workspace/huada/task_results/lstm_ctc_crf_optimized_l9_6x_0214/weights_40.tar'
@@ -124,9 +125,13 @@ def main():
     model = network(config_file).to(device)
     model.load_state_dict(torch.load(pretrained_model_file))
     model.eval()
+    if torch.cuda.is_available():
+        replace_lstm_with_fast(model)
     orig_model = network(config_file).to(device)
     orig_model.load_state_dict(torch.load(pretrained_model_file))
     orig_model.eval()
+    if torch.cuda.is_available():
+        replace_lstm_with_fast(orig_model)
 
     # 构建数据集
     print("[loading data]")
@@ -164,8 +169,9 @@ def main():
     state_dict = torch.load(io_quant_path, map_location=device)
     new_state_dict = {}
     for k, v in state_dict.items():
-        # encoder.X.{0或1}.rnn.* -> encoder.X.rnn.*（第一个LSTM的rnn在索引1，其余在索引0）
-        new_key = re.sub(r'(encoder\.\d+)\.\d+\.(rnn\.)', r'\1.\2', k)
+        new_key = k
+        new_key = re.sub(r'(encoder\.\d+)\.\d+\.(rnn\.)', r'\1.\2', new_key)
+        new_key = re.sub(r'(encoder\.\d+\.rnn\.)lstm\.', r'\1', new_key)
         new_state_dict[new_key] = v
     torch.save(new_state_dict, new_io_quant_path)
 

@@ -70,15 +70,9 @@ def load_model(model_dir, weight_path, device, half=None):
     return model
 
 
-def model_eval(dataloader, model_dir, weight_path, is_half, device):
-    # data = loading_npy_data(npy_dir)
-    # dataloader = DataLoader(
-    #     dataset=data,
-    #     batch_size=batchsize,
-    #     num_workers=4, pin_memory=True, shuffle=False
-    # )
-
-    model = load_model(model_dir=model_dir, weight_path=weight_path, device=device, half=is_half)
+def model_eval(dataloader, model_dir=None, weight_path=None, is_half=True, device=None, model=None):
+    if model is None:
+        model = load_model(model_dir=model_dir, weight_path=weight_path, device=device, half=is_half)
     targets, seqs = [],[]
     t0 = time.perf_counter()
     total_samples = 0
