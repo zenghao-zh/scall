@@ -1,0 +1,3 @@
+train files:
+wy-hg002 YA200005CD-WY 
+ ccf5: YA200005CD-WY_4_* & YA200005CD-WY_7_*

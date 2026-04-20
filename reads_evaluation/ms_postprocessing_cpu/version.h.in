@@ -1,0 +1,3 @@
+#pragma once
+
+#cmakedefine MSPOSTPROCESS_VERSION "@MSPOSTPROCESS_VERSION@"

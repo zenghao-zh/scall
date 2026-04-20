@@ -1,0 +1,31 @@
+{
+  "_name_or_path": "/store/ryl/code_repo/methy_project/_debug_dir/bertsignal/wy_180g_mv/alldata-round0/save-16",
+  "architectures": [
+    "DssmBertModel"
+  ],
+  "attention_probs_dropout_prob": 0.1,
+  "base_feat_nums": 3,
+  "classifier_dropout": null,
+  "embed_size": 4,
+  "gradient_checkpointing": false,
+  "hidden_act": "gelu",
+  "hidden_dropout_prob": 0.1,
+  "hidden_size": 256,
+  "initializer_range": 0.02,
+  "intermediate_size": 1024,
+  "layer_norm_eps": 1e-12,
+  "max_position_embeddings": 17,
+  "model_type": "bert",
+  "num_attention_heads": 4,
+  "num_classify_layers": 3,
+  "num_dssm_layers": 1,
+  "num_hidden_layers": 3,
+  "pad_token_id": 0,
+  "position_embedding_type": "relative_key_query",
+  "signal_size": 16,
+  "torch_dtype": "float32",
+  "transformers_version": "4.48.0.dev0",
+  "type_vocab_size": 2,
+  "use_cache": true,
+  "vocab_size": 16
+}

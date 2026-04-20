@@ -30,6 +30,7 @@ except ImportError:
 
 import time
 
+_BASE_ASCII_MAP = torch.tensor([0, 65, 67, 71, 84], dtype=torch.int8)
 
 def manual_logsumexp(x, dim=-1, keepdim=False):
     """
@@ -550,16 +551,57 @@ class CTC_CRF(SequenceDist):
         # ========================================
         # 步骤5: 回溯得到最优路径 (CPU)
         # ========================================
+        # current_states = alpha_max.argmax(dim=0)
+        # paths = torch.zeros(T, N, dtype=torch.int8, device=device)
+        # batch_idx = torch.arange(N, device=device)
+        
+        # for t in range(T - 1, -1, -1):
+        #     best_edges = traceback[t, current_states, batch_idx]
+        #     paths[t] = best_edges
+        #     current_states = idx[current_states, best_edges.long()]
+
+         # Traceback with per-position confidence
         current_states = alpha_max.argmax(dim=0)
         paths = torch.zeros(T, N, dtype=torch.int8, device=device)
+        confidence = torch.zeros(T, N, device=device, dtype=torch.float32)
         batch_idx = torch.arange(N, device=device)
-        
+
         for t in range(T - 1, -1, -1):
-            best_edges = traceback[t, current_states, batch_idx]
+            dst_state = current_states
+            best_edges = traceback[t, dst_state, batch_idx]
             paths[t] = best_edges
-            current_states = idx[current_states, best_edges.long()]
+            src_state = idx[dst_state, best_edges.long()]
+
+            # Per-position forward-backward posterior along the Viterbi path:
+            #   confidence = alpha(t, src) + Ms(t, dst, edge) + beta(t+1, dst)
+            confidence[t] = (
+                alphas_all[t][src_state, batch_idx]
+                + Ms[t][dst_state, best_edges.long(), batch_idx]
+                + betas_all[t + 1][dst_state, batch_idx]
+            ).float()
+
+            current_states = src_state
+
+        # paths: (T, N), values 0-4 (0=blank, 1-4=ACGT)
+        # Convert to (N, T) beam_search-compatible format
+        paths = paths.T            # (N, T)
+        confidence = confidence.T  # (N, T)
+
+        ascii_map = _BASE_ASCII_MAP.to(device)
+        sequence = ascii_map[paths.long()]            # (N, T) ASCII codes
+        moves = (paths != 0).to(torch.int8)           # (N, T)
+
+        # Convert confidence to Phred+33 quality scores
+        # Normalize per sample: map [min, max] -> [0, 1] -> ASCII [33, 93]
+        # ASCII 33 ('!') = Q0 (lowest), ASCII 93 (']') = Q60 (highest)
+        c_min = confidence.min(dim=1, keepdim=True)[0]
+        c_max = confidence.max(dim=1, keepdim=True)[0]
+        c_range = (c_max - c_min).clamp(min=1e-6)
+        c_norm = (confidence - c_min) / c_range       # [0, 1] per sample
+        qscores = (33 + c_norm * 60).to(torch.int8)   # ASCII 33~93
+        qstring = moves * qscores                      # 0 where blank
         
-        return paths.T.to(torch.long)
+        return paths.to(torch.long)
 
     def viterbi_fused_guided_fast(self, scores):
         """
