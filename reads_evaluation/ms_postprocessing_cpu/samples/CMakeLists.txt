@@ -1,4 +1,4 @@
-foreach(target demo stress parse_dat)
+foreach(target demo stress parse_dat perf)
     add_executable(${target} "${target}.cpp")
 
     target_include_directories(${target}

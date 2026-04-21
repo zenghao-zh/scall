@@ -11,7 +11,7 @@ DEVICE="cuda:0"
 GPU_ID=5
 OUTPUT_DIR="${SCRIPT_DIR}/results"
 THREADS=4
-NAME="0318_moffett_finetune"
+NAME="0318_moffett_finetune_viterbi"
 
 mkdir -p ${OUTPUT_DIR}
 

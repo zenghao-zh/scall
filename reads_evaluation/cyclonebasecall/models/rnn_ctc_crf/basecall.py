@@ -59,6 +59,10 @@ def compute_scores(model, batch, beam_width=32, beam_cut=100.0, scale=1.0, offse
 
         if reverse:
             scores = model.seqdist.reverse_complement(scores)
+        # koi.beam_search only accepts fp16 -- the model may run in bf16 for
+        # inference, so cast here rather than forcing the whole pipeline.
+        if scores.dtype != torch.float16:
+            scores = scores.to(torch.float16)
         cudaSetDevice(scores.device.index)
         sequence, qstring, moves = beam_search(
             scores, beam_width=beam_width, beam_cut=beam_cut,
@@ -87,14 +91,23 @@ def _manual_logsumexp(x, dim=-1, keepdim=False):
 _BASE_ASCII_MAP = torch.tensor([0, 65, 67, 71, 84], dtype=torch.int8)
 
 
-def compute_scores_viterbi(model, batch, use_bfloat16=True):
+def compute_scores_viterbi(model, batch, use_bfloat16=True,
+                           q_shift=0.0, q_scale=1.0):
     """
     Compute scores using viterbi_guided_bidirectional_reshape decoding.
     Returns dict compatible with beam_search format for stitch/fmt.
 
-    Per-position confidence is computed from the forward-backward posterior
-    along the Viterbi path:  confidence[t] = alpha[t,src] + Ms[t,dst,z] + beta[t+1,dst]
-    and mapped to Phred+33 quality scores in the qstring.
+    Per-position confidence is the (normalized) forward-backward edge posterior
+    along the Viterbi path:
+
+        log p_edge(t) = alpha[t,src] + Ms[t,dst,z] + beta[t+1,dst] - log Z_t
+
+    A block that emits a base starts a new base; subsequent stays (blank edges)
+    are attributed to that base. Per-base p_correct is the mean of p_edge over
+    its contributing blocks, and Phred+33 quality follows Bonito / basecall_simple:
+
+        Q = clip(-10 * log10(1 - p_correct) * q_scale + q_shift, 1, 50)
+        qstring[i] = chr(int(33.5 + Q))
     """
     with torch.no_grad():
         device = next(model.parameters()).device
@@ -150,58 +163,124 @@ def compute_scores_viterbi(model, batch, use_bfloat16=True):
         alpha_max[0, :] = 0.0
         traceback = torch.zeros(T, n_states, N, dtype=torch.int8, device=device)
         for t in range(T):
-            # Edge posterior in log space: alpha(t, src) + Ms(t, dst, z) + beta(t+1, dst)
-            edge_post = alphas_all[t][idx, :] + Ms[t] + betas_all[t + 1][:, None, :]
-            # Softmax normalize across all edges per batch element (Log.dsum = softmax)
-            # Use float32 for numerical stability, then convert back
-            flat = edge_post.reshape(-1, N)
-            log_post = (flat - flat.max(dim=0, keepdim=True)[0]).reshape(n_states, n_alphabet, N)
-            # Standard Viterbi step on normalized log-posterior scores
-            alpha_max, best_z = (alpha_max[idx, :] + log_post).max(dim=1)
+            # 在线计算 guided_scores = alpha[src] + Ms + beta[dst]
+            alpha_indexed_src = alphas_all[t][idx, :]
+            beta_indexed_dst = betas_all[t + 1][:, None, :]
+            guided_scores_t = alpha_indexed_src + Ms[t] + beta_indexed_dst
+
+            # Viterbi forward: alpha_max[dst] = max(alpha_max[src] + guided_scores)
+            alpha_indexed_max = alpha_max[idx, :]
+            candidates = alpha_indexed_max + guided_scores_t
+            alpha_max, best_z = candidates.max(dim=1)  # 用 float 保证精度
             traceback[t] = best_z.to(torch.int8)
-            if t % segment_size == 0:
+
+            if t % 8 == 0:
                 alpha_max = alpha_max - alpha_max.max(dim=0, keepdim=True)[0]
 
-        # Traceback with per-position confidence
+        # --- Traceback: record Viterbi edges and destination states ---
+        # `paths[t, n]`       = chosen edge at block t (0=blank/stay, 1-4=ACGT).
+        # `dst_states[t, n]`  = CRF state AFTER block t (needed for the k-mer
+        #                       marginal below).  Loop stays tight -- int-only
+        #                       gathers, no float arithmetic in the hot path.
         current_states = alpha_max.argmax(dim=0)
-        paths = torch.zeros(T, N, dtype=torch.int8, device=device)
-        confidence = torch.zeros(T, N, device=device, dtype=torch.float32)
+        paths = torch.empty(T, N, dtype=torch.long, device=device)
+        dst_states = torch.empty(T, N, dtype=torch.long, device=device)
         batch_idx = torch.arange(N, device=device)
 
         for t in range(T - 1, -1, -1):
-            dst_state = current_states
-            best_edges = traceback[t, dst_state, batch_idx]
+            dst_states[t] = current_states
+            best_edges = traceback[t, current_states, batch_idx].long()
             paths[t] = best_edges
-            src_state = idx[dst_state, best_edges.long()]
+            current_states = idx[current_states, best_edges]
 
-            # Per-position forward-backward posterior along the Viterbi path:
-            #   confidence = alpha(t, src) + Ms(t, dst, edge) + beta(t+1, dst)
-            confidence[t] = (
-                alphas_all[t][src_state, batch_idx]
-                + Ms[t][dst_state, best_edges.long(), batch_idx]
-                + betas_all[t + 1][dst_state, batch_idx]
-            ).float()
+        # --- Build the "shifted k-mer neighbor" table used by basecall_simple ---
+        # For a CRF state s (integer-encoded k-mer), basecall_simple derives Q
+        # from the marginal posterior over s and its 2*n_base de-Bruijn-graph
+        # neighbors, with duplicates removed:
+        #     l_shift(s, b) = (s >> log2(n_base)) + msb * b       -- prepend b
+        #     r_shift(s, b) = (s << log2(n_base)) mod n_states + b -- append b
+        # Slot order within cand_tbl (self, 4 l-shifts, 4 r-shifts) doesn't
+        # affect the final block_prob: the dedup mask keeps exactly one copy
+        # of each unique state regardless of ordering.  Depends only on
+        # (n_states, n_base), so cache on seqdist across batches.
+        if (not hasattr(seqdist, '_qual_cand_tbl')
+                or seqdist._qual_cand_tbl.device != device):
+            s = torch.arange(n_states, device=device, dtype=torch.long)
+            b = torch.arange(n_base, device=device, dtype=torch.long)
+            msb = n_states // n_base
+            cand_tbl = torch.cat([
+                s.unsqueeze(1),                                    # self
+                (s // n_base).unsqueeze(1) + msb * b,              # l-shifts
+                ((s * n_base) % n_states).unsqueeze(1) + b,        # r-shifts
+            ], dim=1)                                              # (n_states, 1+2*n_base)
 
-            current_states = src_state
+            # Slot k is "unique" iff it doesn't match any earlier slot j<k.
+            cand_mask = torch.ones_like(cand_tbl, dtype=torch.bool)
+            for k in range(1, cand_tbl.shape[1]):
+                cand_mask[:, k] = (cand_tbl[:, k:k + 1] != cand_tbl[:, :k]).all(dim=-1)
 
-        # paths: (T, N), values 0-4 (0=blank, 1-4=ACGT)
-        # Convert to (N, T) beam_search-compatible format
-        paths = paths.T            # (N, T)
-        confidence = confidence.T  # (N, T)
+            seqdist._qual_cand_tbl = cand_tbl
+            seqdist._qual_cand_mask = cand_mask
+        cand_tbl = seqdist._qual_cand_tbl
+        cand_mask = seqdist._qual_cand_mask
 
-        ascii_map = _BASE_ASCII_MAP.to(device)
-        sequence = ascii_map[paths.long()]            # (N, T) ASCII codes
-        moves = (paths != 0).to(torch.int8)           # (N, T)
+        # --- Per-block k-mer-marginal posterior (matches basecall_simple) ---
+        # posts[t+1, s, n] = softmax_s(alpha + beta)[t+1, s, n]
+        # block_prob[t, n] = sum over unique cand_tbl[dst_states[t, n]] of posts
+        #
+        # Only 1+2*n_base states per (t, n) are ever touched, so we gather
+        # directly from (alpha+beta) and normalize by a per-(t, n) logZ --
+        # cheaper than materializing the full (T, N, n_states) softmax.
+        ab_sum = (alphas_all + betas_all).float()              # (T+1, n_states, N)
+        logZ = torch.logsumexp(ab_sum[1:T + 1], dim=1)          # (T, N)
 
-        # Convert confidence to Phred+33 quality scores
-        # Normalize per sample: map [min, max] -> [0, 1] -> ASCII [33, 93]
-        # ASCII 33 ('!') = Q0 (lowest), ASCII 93 (']') = Q60 (highest)
-        c_min = confidence.min(dim=1, keepdim=True)[0]
-        c_max = confidence.max(dim=1, keepdim=True)[0]
-        c_range = (c_max - c_min).clamp(min=1e-6)
-        c_norm = (confidence - c_min) / c_range       # [0, 1] per sample
-        qscores = (33 + c_norm * 60).to(torch.int8)   # ASCII 33~93
-        qstring = moves * qscores                      # 0 where blank
+        cand_path = cand_tbl[dst_states]                       # (T, N, C)
+        mask_path = cand_mask[dst_states].float()              # (T, N, C) float32
+        t_plus1 = torch.arange(1, T + 1, device=device).view(T, 1, 1)
+        n_idx = batch_idx.view(1, N, 1)
+
+        # ab_cand[t, n, c] = ab_sum[t+1, cand_path[t, n, c], n]
+        ab_cand = ab_sum[t_plus1, cand_path, n_idx]            # (T, N, C)
+
+        # Fuse exp -> dedup mask -> sum -> clamp -> ^0.4 fudge factor.
+        block_prob = (
+            (ab_cand - logZ.unsqueeze(-1)).exp_() * mask_path
+        ).sum(dim=-1).clamp_(0.0, 1.0).pow_(0.4)               # (T, N)
+
+        # --- Aggregate per base and build Phred+33 qstring ---
+        # Transpose to (N, T): downstream cumsum / scatter_add / gather all
+        # operate along T, which is the inner dim -> cache-friendly on CPU.
+        paths = paths.T.contiguous()                           # (N, T) long
+        block_prob = block_prob.T.contiguous()                 # (N, T) float32
+        moves = (paths != 0)                                   # (N, T) bool
+
+        # A move starts a new base; subsequent stays contribute to the same
+        # base (same grouping as `generate_sequence()` in basecall_simple).
+        moves_long = moves.long()                              # (N, T)
+        label = moves_long.cumsum(dim=1)                       # 1-indexed base pos
+        valid = (label > 0).to(block_prob.dtype)               # mask leading stays
+        label_idx = (label - 1).clamp_(min=0)                  # 0-indexed
+
+        # max_bases.item() is a CPU sync but free on CPU runs; on GPU it's
+        # one small sync per batch.  Needed to size the scatter buffers tight.
+        max_bases = max(int(moves_long.sum(dim=1).max()), 1) if N > 0 else 1
+
+        sum_p = torch.zeros(N, max_bases, dtype=block_prob.dtype, device=device)
+        cnt = torch.zeros(N, max_bases, dtype=block_prob.dtype, device=device)
+        sum_p.scatter_add_(1, label_idx, block_prob * valid)
+        cnt.scatter_add_(1, label_idx, valid)
+        p_correct = sum_p / cnt.clamp_(min=1e-6)               # (N, max_bases)
+
+        # Phred + affine calibration, fused into one expression.
+        p_err = (1.0 - p_correct).clamp_(min=1e-6, max=1.0)
+        qscore = (-10.0 * torch.log10(p_err) * q_scale + q_shift).clamp_(1.0, 50.0)
+        qbyte_base = (33.5 + qscore).to(torch.int16)           # ASCII per base
+
+        # Scatter per-base ASCII back to (N, T) interleaved layout: ASCII at
+        # move positions, 0 elsewhere (downstream `to_str` strips zeros).
+        sequence = _BASE_ASCII_MAP.to(device)[paths].to(torch.int8)  # (N, T) ASCII
+        qstring = (torch.gather(qbyte_base, 1, label_idx) * moves_long).to(torch.int8)
+        moves = moves.to(torch.int8)                           # (N, T) for output
 
         return {
             'moves': moves.cpu(),
@@ -239,6 +318,7 @@ def basecall(model, reads, chunksize=4000, overlap=100, batchsize=32, model_stri
         scores = thread_iter(
             (read, compute_scores(model, batch, reverse=reverse, scale=scale, offset=offset)) for read, batch in batches
         )
+        
 
     results = thread_iter(
         (read, stitch_results(scores, end - start, chunksize, overlap, model_stride, reverse))
