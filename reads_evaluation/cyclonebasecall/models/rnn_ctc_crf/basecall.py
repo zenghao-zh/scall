@@ -273,7 +273,7 @@ def compute_scores_viterbi(model, batch, use_bfloat16=True,
 
         # Phred + affine calibration, fused into one expression.
         p_err = (1.0 - p_correct).clamp_(min=1e-6, max=1.0)
-        qscore = (-10.0 * torch.log10(p_err) * q_scale + q_shift).clamp_(1.0, 50.0)
+        qscore = (-10.0 * torch.log10(p_err) * q_scale + q_shift).clamp_(1.0, 93.0)
         qbyte_base = (33.5 + qscore).to(torch.int16)           # ASCII per base
 
         # Scatter per-base ASCII back to (N, T) interleaved layout: ASCII at
