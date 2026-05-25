@@ -7,11 +7,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 READS="/workspace/huada/moffett_data/ccf_eval"
 REF="/workspace/huada/moffett_data/HG002.fasta"
 MODEL_DIR="/workspace/huada/task_results/lstm_ctc_crf_finetune_moffett_fast"
+# MODEL_DIR="/workspace/huada/task_results/lstm_ctc_crf_baseline_0214"
 DEVICE="cuda:0"
 GPU_ID=5
 OUTPUT_DIR="${SCRIPT_DIR}/results"
 THREADS=4
-NAME="0318_moffett_finetune_viterbi"
+NAME="0521_moffett_finetune_viterbi_bf16"
 
 mkdir -p ${OUTPUT_DIR}
 

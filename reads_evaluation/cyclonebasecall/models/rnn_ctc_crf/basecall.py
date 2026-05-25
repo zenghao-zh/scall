@@ -231,11 +231,16 @@ def compute_scores_viterbi(model, batch, use_bfloat16=True,
         # Only 1+2*n_base states per (t, n) are ever touched, so we gather
         # directly from (alpha+beta) and normalize by a per-(t, n) logZ --
         # cheaper than materializing the full (T, N, n_states) softmax.
-        ab_sum = (alphas_all + betas_all).float()              # (T+1, n_states, N)
+        #  - T = 960
+        #   - N = 512 (batch size)
+        #   - n_states = 1024
+        #   - self.state_len = 5
+        #   - self.n_base = 4
+        ab_sum = (alphas_all + betas_all)           # (T+1, n_states, N)
         logZ = torch.logsumexp(ab_sum[1:T + 1], dim=1)          # (T, N)
 
         cand_path = cand_tbl[dst_states]                       # (T, N, C)
-        mask_path = cand_mask[dst_states].float()              # (T, N, C) float32
+        mask_path = cand_mask[dst_states].float()        # (T, N, C) float32
         t_plus1 = torch.arange(1, T + 1, device=device).view(T, 1, 1)
         n_idx = batch_idx.view(1, N, 1)
 
